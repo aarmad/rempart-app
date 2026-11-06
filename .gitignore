@@ -1,0 +1,11 @@
+# Secrets : ne JAMAIS committer le vrai .env
+.env
+.env.*
+!.env.example
+
+# Dependances
+node_modules/
+npm-debug.log*
+
+# Divers
+.DS_Store
