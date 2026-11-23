@@ -6,6 +6,26 @@ const app = express();
 app.use(express.json());
 const port = process.env.PORT || 8000;
 
+// Content-Security-Policy (bonus) : meme simple, elle bloque les scripts inline
+// et les sources externes. script-src 'self' => un <script> injecte ou un
+// onerror=... ne s'execute pas, en 2e barriere apres l'echappement.
+app.use((req, res, next) => {
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+  );
+  next();
+});
+
+// Echappe une donnee pour l'inserer comme TEXTE dans du HTML.
+// (equivalent d'un template qui echappe : < devient &lt;, etc.)
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 // Connexion a la base via une variable d'environnement.
 // L'app se connecte avec un compte au MOINDRE PRIVILEGE (lecture seule),
 // pas avec le superutilisateur de la base.
@@ -34,8 +54,10 @@ app.get('/', (req, res) => {
   <main class="card">
     <h1>Rempart est debout</h1>
     <p>Base : <a href="/health">/health</a></p>
-    <p>Recherche (requete parametree) :
+    <p>Recherche JSON (requete parametree) :
        <a href="/products?q=clavier">/products?q=clavier</a></p>
+    <p>Recherche HTML (sortie echappee) :
+       <a href="/search?q=clavier">/search?q=clavier</a></p>
     <p>Login : <code>POST /login</code> { email, password }</p>
   </main>
 </body>
@@ -68,6 +90,45 @@ app.get('/products', async (req, res) => {
   } catch (err) {
     console.error('[products]', err);
     res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// --- Page de resultats HTML : SORTIE ECHAPPEE -----------------------------
+// La donnee utilisateur (q) et les noms de produits sont inseres via
+// escapeHtml() : ils sortent en TEXTE, jamais interpretes comme du HTML.
+app.get('/search', async (req, res) => {
+  const q = (req.query.q || '').toString();
+  try {
+    const result = await pool.query(
+      'SELECT id, name, price FROM products WHERE name ILIKE $1 ORDER BY id',
+      ['%' + q + '%']
+    );
+    const items = result.rows
+      .map((p) => `<li>${escapeHtml(p.name)} — ${escapeHtml(p.price)} EUR</li>`)
+      .join('');
+    res.type('html').send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recherche - Rempart</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; background:#0f1222; color:#e8e8f0;
+           margin:0; padding:2rem; }
+    a { color:#ff9a62; } ul { line-height:1.8; }
+    .echo { background:#1b2040; padding:.4rem .6rem; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <p><a href="/">&larr; Accueil</a></p>
+  <h1>Resultats de recherche</h1>
+  <p>Vous avez cherche : <span class="echo">${escapeHtml(q)}</span></p>
+  <ul>${items || '<li>Aucun resultat</li>'}</ul>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('[search]', err);
+    res.status(500).type('html').send('Erreur interne');
   }
 });
 

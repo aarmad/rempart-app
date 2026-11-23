@@ -208,3 +208,61 @@ Verifie :
 
 Ainsi, meme si une faille future laissait passer une requete malveillante, le
 compte ne pourrait ni modifier ni detruire les donnees.
+
+## Sortie echappee (defense XSS)
+
+### Ou affiche-t-on une donnee utilisateur ?
+
+Sur la page HTML `GET /search` : le terme recherche et les noms de produits y
+sont affiches. Chaque valeur passe par `escapeHtml()` avant d'entrer dans le
+HTML, donc elle sort en **TEXTE**, jamais interpretee comme des balises. Extrait
+de `server.js` :
+
+```js
+res.type('html').send(`...
+  <p>Vous avez cherche : <span class="echo">${escapeHtml(q)}</span></p>
+  <ul>${items}</ul>  // items = ...map(p => `<li>${escapeHtml(p.name)}...`)
+...`);
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+```
+
+### Preuve : `<img src=x onerror=...>` s'affiche en toutes lettres
+
+Requete : `GET /search?q=<img src=x onerror=alert(1)>`
+Reponse (le HTML recu) :
+
+```html
+<span class="echo">&lt;img src=x onerror=alert(1)&gt;</span>
+```
+
+Les `<` et `>` sont devenus `&lt;` / `&gt;` : le navigateur affiche le texte
+`<img src=x onerror=alert(1)>` au lieu de creer une balise. L'`onerror` ne
+s'execute pas. (A comparer avec le DOM XSS de Juice Shop, ou la donnee entrait
+via `innerHTML` sans echappement.)
+
+### Du HTML riche est-il necessaire ? (DOMPurify)
+
+Non. Toute donnee utilisateur de cette app est du **texte simple** (recherche,
+email, avis). On l'**echappe**, c'est suffisant et plus sur. DOMPurify ne sert
+que si on devait un jour accepter du HTML riche d'un utilisateur (ex. un editeur
+WYSIWYG) : on passerait alors la valeur par `DOMPurify.sanitize(html)` avant
+affichage, au lieu de l'echapper. Tant que ce besoin n'existe pas, on ne
+l'introduit pas : moins de code, moins de surface.
+
+### Content-Security-Policy (bonus)
+
+Un en-tete CSP est pose sur toutes les reponses (`server.js`) comme 2e barriere :
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self';
+  style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+  object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+```
+
+`script-src 'self'` interdit les scripts inline et les gestionnaires d'evenement
+(`onerror=...`) : meme si un HTML malveillant passait l'echappement, le
+navigateur refuserait de l'executer.
