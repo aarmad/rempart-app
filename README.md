@@ -310,3 +310,40 @@ Et meme s'il passait : le fichier serait **renomme** (plus d'extension `.php`),
 **stocke hors du dossier public** (aucune URL ne l'execute), et **servi en piece
 jointe avec `nosniff`** (telecharge, jamais interprete par le navigateur). Trois
 barrieres independantes, pas une seule.
+
+## Erreurs generiques (defense)
+
+L'inverse de l'"erreur bavarde" : l'utilisateur ne voit jamais de trace
+technique. Trois mesures dans `server.js` :
+
+| Mesure | Mise en oeuvre |
+| --- | --- |
+| Page d'erreur generique | `respondError()` renvoie un message neutre (HTML ou JSON) + une **reference** (`errorId`), jamais de pile |
+| Detail journalise cote serveur | un gestionnaire d'erreur global `app.use((err,req,res,next) => ...)` fait `console.error(errorId, err.stack)` : le detail va dans les **journaux**, pas dans la reponse |
+| Debug coupe hors dev | `NODE_ENV=production` (compose) ; le detail n'est ajoute a la reponse que si `NODE_ENV=development`. En prod, message strictement generique |
+
+En plus : 404 generique (`app.use` final) et en-tete `X-Powered-By` masque
+(`app.disable('x-powered-by')`).
+
+### Reponse vue par l'utilisateur, et ou est passe le detail
+
+Erreur declenchee en envoyant du JSON malforme a `POST /login`.
+
+Reponse **vue par l'utilisateur** :
+
+```json
+{ "ok": false, "error": "Une erreur est survenue. Reessayez plus tard.",
+  "errorId": "8c913125b6a8" }
+```
+
+Detail, **uniquement dans les journaux du serveur** (meme errorId) :
+
+```
+[error 8c913125b6a8] SyntaxError: Expected property name or '}' in JSON ...
+    at JSON.parse (<anonymous>)
+    at /app/node_modules/body-parser/lib/read.js:146:18
+```
+
+Le detail (type d'erreur, pile, chemins internes) n'atteint jamais le client :
+il part dans les journaux, relie a la reponse de l'utilisateur par l'`errorId`.
+Pour le support, l'utilisateur n'a qu'a citer cette reference.

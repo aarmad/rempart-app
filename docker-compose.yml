@@ -5,6 +5,8 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
+      # Mode debug coupe hors developpement : pas de trace technique renvoyee.
+      - NODE_ENV=production
       # L'app se connecte avec le compte applicatif (lecture seule),
       # PAS avec le superutilisateur POSTGRES_USER.
       - DATABASE_URL=postgres://${APP_DB_USER}:${APP_DB_PASSWORD}@db:5432/${POSTGRES_DB}

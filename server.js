@@ -6,8 +6,11 @@ const multer = require('multer');
 const { Pool } = require('pg');
 
 const app = express();
+app.disable('x-powered-by');          // ne pas divulguer le moteur (Express)
 app.use(express.json());
 const port = process.env.PORT || 8000;
+// Mode debug coupe hors developpement : vrai uniquement si NODE_ENV=development.
+const isDev = process.env.NODE_ENV === 'development';
 
 // --- Upload verrouille : configuration ------------------------------------
 // Les fichiers sont stockes HORS du dossier public : aucune route statique ne
@@ -42,6 +45,32 @@ app.use((req, res, next) => {
   );
   next();
 });
+
+// Reponse d'erreur GENERIQUE (jamais de trace technique cote utilisateur).
+// errorId relie la reponse de l'utilisateur au detail journalise cote serveur.
+function respondError(req, res, status, message, errorId) {
+  res.status(status);
+  const wantsJson =
+    (req.headers.accept || '').includes('application/json') ||
+    req.path.startsWith('/api') || req.path === '/health';
+  if (wantsJson) {
+    res.json({ ok: false, error: message, ...(errorId ? { errorId } : {}) });
+  } else {
+    res.type('html').send(`<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Erreur - Rempart</title>
+<style>body{font:16px system-ui,sans-serif;background:#0f1222;color:#e8e8f0;
+display:grid;place-items:center;min-height:100vh;margin:0}.c{text-align:center;
+padding:2rem;max-width:34rem}a{color:#ff9a62}</style></head>
+<body><main class="c">
+  <h1>Oups, une erreur est survenue</h1>
+  <p>${escapeHtml(message)}</p>
+  ${errorId ? `<p style="color:#8a90b5">Reference : ${escapeHtml(errorId)}</p>` : ''}
+  <p><a href="/">Retour a l'accueil</a></p>
+</main></body></html>`);
+  }
+}
 
 // Echappe une donnee pour l'inserer comme TEXTE dans du HTML.
 // (equivalent d'un template qui echappe : < devient &lt;, etc.)
@@ -257,6 +286,30 @@ function verifyPassword(password, stored) {
   return expected.length === actual.length &&
          crypto.timingSafeEqual(expected, actual);
 }
+
+// 404 : page generique, pas de details sur ce qui existe ou non.
+app.use((req, res) => {
+  respondError(req, res, 404, 'Page introuvable.');
+});
+
+// Gestionnaire d'erreur GLOBAL (doit avoir 4 arguments).
+// Le DETAIL (message + pile) est journalise cote serveur ; l'utilisateur ne
+// recoit qu'un message neutre et une reference pour le support.
+app.use((err, req, res, next) => {
+  const errorId = crypto.randomBytes(6).toString('hex');
+  // -> va dans les journaux du serveur, PAS dans la reponse.
+  console.error(`[error ${errorId}]`, err.stack || err);
+
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  const safeStatus = status >= 400 && status < 500 ? status : 500;
+  // Hors dev, message strictement generique. En dev seulement, on aide le
+  // developpeur avec le message (jamais la pile) dans la reponse.
+  const message = isDev
+    ? `Une erreur est survenue : ${err.message}`
+    : 'Une erreur est survenue. Reessayez plus tard.';
+  respondError(req, res, safeStatus, message, errorId);
+});
 
 app.listen(port, () => {
   console.log(`Rempart app en ecoute sur http://localhost:${port}`);
