@@ -266,3 +266,47 @@ Content-Security-Policy: default-src 'self'; script-src 'self';
 `script-src 'self'` interdit les scripts inline et les gestionnaires d'evenement
 (`onerror=...`) : meme si un HTML malveillant passait l'echappement, le
 navigateur refuserait de l'executer.
+
+## Upload verrouille (defense)
+
+Endpoint `POST /upload` (formulaire sur `GET /upload`). Cinq verrous :
+
+| Verrou | Mise en oeuvre (`server.js`) |
+| --- | --- |
+| Liste blanche de types | seuls `image/jpeg` et `image/png` sont acceptes |
+| Contenu verifie (pas l'extension) | lecture des **magic bytes** (`FF D8 FF` / `89 50 4E 47`), pas du nom ni du type declare |
+| Fichier renomme | nom aleatoire `crypto.randomBytes(16).hex + .jpg/.png` |
+| Taille maximale | `multer` limite a 2 Mo -> 413 au-dela |
+| Hors dossier public | stocke dans `uploads/`, servi uniquement par `/files/:id` |
+
+Telechargement sans danger (`GET /files/:id`) :
+
+```js
+res.setHeader('Content-Type', type);              // type verifie
+res.setHeader('X-Content-Type-Options', 'nosniff'); // pas de "devinette" de type
+res.setHeader('Content-Disposition', 'attachment; ...'); // telecharge, pas rendu
+```
+
+Le nom est valide par `^[a-f0-9]{32}\.(jpg|png)$` (anti path traversal).
+
+### Preuve : `.php` et `.svg` sont refuses
+
+| Envoi | Reponse |
+| --- | --- |
+| Vrai PNG | `200 {ok:true, stored:"<hex>.png"}` |
+| `script.php` renomme `script.jpg` | `415 type refuse : seul un vrai JPEG ou PNG est accepte` |
+| `evil.svg` (contient un `<script>`) | `415 type refuse ...` |
+| Fichier de 3 Mo | `413 fichier trop volumineux` |
+| `/files/..%2f..%2fserver.js` | `400` |
+
+### Que se passe-t-il si je renomme un script en .jpg et que je l'envoie ?
+
+Il est **refuse**. L'extension `.jpg` et le type MIME declare ne sont pas crus :
+le serveur lit les premiers octets du fichier. Un script (`<?php ...`, ou un SVG
+`<svg>`) ne commence pas par la signature d'un JPEG (`FF D8 FF`) ou d'un PNG
+(`89 50 4E 47`), donc il ne passe pas la liste blanche -> `415`.
+
+Et meme s'il passait : le fichier serait **renomme** (plus d'extension `.php`),
+**stocke hors du dossier public** (aucune URL ne l'execute), et **servi en piece
+jointe avec `nosniff`** (telecharge, jamais interprete par le navigateur). Trois
+barrieres independantes, pas une seule.

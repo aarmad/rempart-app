@@ -9,3 +9,6 @@ npm-debug.log*
 
 # Divers
 .DS_Store
+
+# Fichiers recus a l execution (pas du code)
+uploads/

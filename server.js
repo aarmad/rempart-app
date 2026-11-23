@@ -1,10 +1,35 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
+const multer = require('multer');
 const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
 const port = process.env.PORT || 8000;
+
+// --- Upload verrouille : configuration ------------------------------------
+// Les fichiers sont stockes HORS du dossier public : aucune route statique ne
+// sert ce dossier, seul /files/:id (controle) y donne acces.
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const MAX_UPLOAD = 2 * 1024 * 1024; // taille maximale : 2 Mo
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD, files: 1 },
+});
+
+// Liste blanche : on identifie le type par le CONTENU (magic bytes),
+// pas par l'extension ni le type MIME declare par le client.
+const ALLOWED_TYPES = [
+  { type: 'image/jpeg', ext: 'jpg',
+    sniff: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { type: 'image/png', ext: 'png',
+    sniff: (b) => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 &&
+                  b[2] === 0x4e && b[3] === 0x47 },
+];
 
 // Content-Security-Policy (bonus) : meme simple, elle bloque les scripts inline
 // et les sources externes. script-src 'self' => un <script> injecte ou un
@@ -58,6 +83,7 @@ app.get('/', (req, res) => {
        <a href="/products?q=clavier">/products?q=clavier</a></p>
     <p>Recherche HTML (sortie echappee) :
        <a href="/search?q=clavier">/search?q=clavier</a></p>
+    <p>Upload verrouille (JPEG/PNG only) : <a href="/upload">/upload</a></p>
     <p>Login : <code>POST /login</code> { email, password }</p>
   </main>
 </body>
@@ -130,6 +156,71 @@ app.get('/search', async (req, res) => {
     console.error('[search]', err);
     res.status(500).type('html').send('Erreur interne');
   }
+});
+
+// --- Upload verrouille : formulaire ---------------------------------------
+app.get('/upload', (req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload - Rempart</title>
+<style>body{font:16px system-ui,sans-serif;background:#0f1222;color:#e8e8f0;
+margin:0;padding:2rem}a{color:#ff9a62}</style></head>
+<body>
+  <p><a href="/">&larr; Accueil</a></p>
+  <h1>Upload verrouille</h1>
+  <p>Accepte uniquement JPEG / PNG (contenu verifie), max 2 Mo.</p>
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <input type="file" name="file" required>
+    <button type="submit">Envoyer</button>
+  </form>
+</body></html>`);
+});
+
+// --- Upload verrouille : reception ----------------------------------------
+app.post('/upload', (req, res) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ ok: false, error: 'fichier trop volumineux (max 2 Mo)' });
+      }
+      return res.status(400).json({ ok: false, error: 'upload invalide' });
+    }
+    if (!req.file) return res.status(400).json({ ok: false, error: 'aucun fichier' });
+
+    // Verifier le CONTENU, pas l'extension ni le type declare par le client.
+    const buf = req.file.buffer;
+    const match = ALLOWED_TYPES.find((a) => a.sniff(buf));
+    if (!match) {
+      return res.status(415).json({
+        ok: false,
+        error: 'type refuse : seul un vrai JPEG ou PNG est accepte',
+        recu: req.file.originalname,
+      });
+    }
+
+    // Renommer : nom aleatoire + extension derivee du CONTENU verifie.
+    const stored = crypto.randomBytes(16).toString('hex') + '.' + match.ext;
+    fs.writeFileSync(path.join(UPLOAD_DIR, stored), buf);
+    res.json({ ok: true, stored, type: match.type, url: '/files/' + stored });
+  });
+});
+
+// --- Upload verrouille : telechargement sans danger -----------------------
+app.get('/files/:id', (req, res) => {
+  const id = req.params.id;
+  // Nom strict (anti path traversal) : 32 hex + .jpg/.png, rien d'autre.
+  if (!/^[a-f0-9]{32}\.(jpg|png)$/.test(id)) return res.status(400).end();
+  const full = path.join(UPLOAD_DIR, id);
+  if (!fs.existsSync(full)) return res.status(404).end();
+
+  const type = id.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  res.setHeader('Content-Type', type);
+  // nosniff : le navigateur ne "devine" pas un autre type que celui annonce.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // attachment : le fichier est telecharge, jamais rendu/execute dans la page.
+  res.setHeader('Content-Disposition', `attachment; filename="${id}"`);
+  fs.createReadStream(full).pipe(res);
 });
 
 // --- Login : REQUETE PARAMETREE + verification du mot de passe en code -----
