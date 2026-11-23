@@ -347,3 +347,38 @@ Detail, **uniquement dans les journaux du serveur** (meme errorId) :
 Le detail (type d'erreur, pile, chemins internes) n'atteint jamais le client :
 il part dans les journaux, relie a la reponse de l'utilisateur par l'`errorId`.
 Pour le support, l'utilisateur n'a qu'a citer cette reference.
+
+## Tests de securite automatises
+
+Fichier `test/security.test.js`, lances avec le runner integre de Node :
+
+```bash
+docker compose up -d          # l'app doit tourner
+npm test                      # = node --test  (BASE_URL pour cibler une autre URL)
+```
+
+Trois attaques, chacune avec une assertion precise :
+
+| Test | Charge envoyee | Assertion (resultat sain) |
+| --- | --- | --- |
+| Injection SQL | `' OR '1'='1` sur `/products` et `/login` | `count === 0` (et `< ` au controle positif) ; login `401 ok:false` |
+| XSS | `<img src=x onerror=alert(1)>` sur `/search` | la version **echappee** est presente ET la balise **brute** est absente |
+| Upload interdit | `.php` deguise en `.jpg` sur `/upload` | statut **415**, `ok:false` |
+
+Resultat : `pass 4  fail 0`.
+
+### Comment on sait que l'attaque a ECHOUE (pas juste "pas plante")
+
+Chaque test combine deux choses :
+
+1. **Une assertion sur le resultat attendu**, pas sur l'absence de crash.
+   Exemple XSS : on verifie que la reponse contient
+   `&lt;img src=x onerror=alert(1)&gt;` (echappe) **et** ne contient PAS
+   `<img src=x onerror=alert(1)>` (brut). Si l'app etait vulnerable
+   (`innerHTML`), la balise brute serait presente et le test passerait au ROUGE.
+2. **Un controle positif** : la recherche normale renvoie des resultats, un vrai
+   PNG est accepte. Donc un endpoint casse (500, reponse vide) ferait echouer ce
+   controle. Un test ne peut pas passer "par accident" juste parce que le serveur
+   a renvoye quelque chose.
+
+Un `200` ou un "pas d'exception" ne suffisent jamais : on verifie la **valeur**.
