@@ -1,0 +1,7 @@
+# Forcer les fins de ligne LF : indispensable pour les scripts executes dans
+# les conteneurs Linux (un CRLF casserait le shebang), et stable partout.
+*.sh    text eol=lf
+*.sql   text eol=lf
+*.yml   text eol=lf
+*.js    text eol=lf
+Dockerfile text eol=lf
