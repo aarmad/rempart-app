@@ -74,18 +74,6 @@ dans toute copie deja clonee (dont GitHub). Il faut considerer le secret comme
    `.env.example` sans valeur), et activer la detection de secrets (ex.
    protection de push / scan de secrets GitHub).
 
-## Utilisation de l'IA
-
-Ce squelette a ete mis en place avec l'aide de Claude (Claude Code) :
-
-- Generation du squelette Express, du `docker-compose.yml`, du `Dockerfile` et
-  de ce README.
-- Explications sur la gestion des secrets (`.env` ignore, rotation d'un secret
-  deja pousse).
-
-Tout le code a ete relu et teste manuellement avant d'etre valide. Les secrets
-reels n'ont jamais ete partages avec l'IA.
-
 ## Securite (carte des menaces)
 
 Penser en attaquant avant d'ajouter des fonctionnalites : qui entre, par ou, et
@@ -154,3 +142,69 @@ frontiere app -> base et donne acces a **toutes** les donnees et identifiants,
 voire a l'execution de commandes sur le serveur de base. C'est pour cela qu'elle
 passe avant les autres : impact maximal (compromission totale) et surface
 directement exposee a Internet.
+
+## Requetes parametrees et moindre privilege (defense)
+
+Parade directe de la menace #1 : la donnee utilisateur ne touche **jamais** le
+texte de la requete SQL.
+
+### Ou la donnee est-elle separee de la requete ?
+
+Chaque requete utilise des **placeholders** (`$1`, `$2`, ...) et passe la donnee
+**separement**, dans un tableau. Extrait de `server.js` (recherche de produits) :
+
+```js
+// server.js  -> GET /products
+const result = await pool.query(
+  'SELECT id, name, price FROM products WHERE name ILIKE $1 ORDER BY id',
+  ['%' + q + '%']          // <-- la donnee voyage ICI, hors du texte SQL
+);
+```
+
+Et pour le login :
+
+```js
+// server.js  -> POST /login
+const result = await pool.query(
+  'SELECT id, email, pass_hash, role FROM app_users WHERE email = $1',
+  [email]                  // <-- "email" est une donnee, jamais du code
+);
+```
+
+Le pilote `pg` envoie le texte de la requete et les valeurs par des canaux
+distincts : une valeur ne peut pas devenir un mot-cle SQL. Le mot de passe, lui,
+est verifie **en code** (scrypt a temps constant), pas dans une requete.
+
+### Preuve : `' OR '1'='1` ne renvoie rien d'anormal
+
+| Entree | Resultat |
+| --- | --- |
+| `GET /products?q=clavier` | 1 resultat (Clavier mecanique) |
+| `GET /products?q=' OR '1'='1` | **0 resultat** : la charge est cherchee comme un simple texte |
+| `POST /login` demo + bon mot de passe | `{"ok":true, role:"admin"}` |
+| `POST /login` email = `' OR '1'='1` | `401 identifiants invalides` (aucun bypass) |
+
+### Compte base au moindre privilege
+
+L'app ne se connecte PAS avec le superutilisateur. Un role dedie `rempart_app`
+est cree a l'init (`db/init/02-app-role.sh`) avec le strict minimum :
+
+```sql
+CREATE ROLE rempart_app LOGIN PASSWORD '***'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+GRANT CONNECT ON DATABASE rempart TO rempart_app;
+GRANT USAGE ON SCHEMA public TO rempart_app;
+GRANT SELECT ON products, app_users TO rempart_app;   -- lecture seule
+```
+
+Verifie :
+
+| Action du role `rempart_app` | Resultat |
+| --- | --- |
+| Superutilisateur ? | **non** (`rolsuper = f`) |
+| `SELECT` sur products | autorise |
+| `INSERT` sur products | **refuse** (`permission denied`) |
+| `DROP TABLE app_users` | **refuse** (`must be owner`) |
+
+Ainsi, meme si une faille future laissait passer une requete malveillante, le
+compte ne pourrait ni modifier ni detruire les donnees.
