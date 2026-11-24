@@ -119,3 +119,25 @@ test('les tentatives sont limitees (429 apres plusieurs echecs)', async () => {
   // La preuve que le brute-force est freine : la derniere tentative est bloquee.
   assert.equal(last, 429, 'apres le quota, la connexion doit renvoyer 429');
 });
+
+// --- 6) Controle d'acces par role (cote serveur) ------------------------
+test('route admin : 403 pour un simple utilisateur, 200 pour un admin', async () => {
+  // Simple utilisateur (role 'user' par defaut) : l'inscription ouvre une session.
+  const email = `u-${Date.now()}@test.local`;
+  const reg = await fetch(`${BASE}/register`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: 'motdepasse1234' }),
+  });
+  const userCookie = (reg.headers.get('set-cookie') || '').split(';')[0];
+  const asUser = await fetch(`${BASE}/admin`, { headers: { Cookie: userCookie } });
+  assert.equal(asUser.status, 403, 'un simple utilisateur doit etre refuse (403)');
+
+  // Admin (compte de demo) : acces autorise.
+  const login = await fetch(`${BASE}/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'demo@rempart.local', password: 'Demo#1234' }),
+  });
+  const adminCookie = (login.headers.get('set-cookie') || '').split(';')[0];
+  const asAdmin = await fetch(`${BASE}/admin`, { headers: { Cookie: adminCookie } });
+  assert.equal(asAdmin.status, 200, 'un admin doit etre autorise (200)');
+});

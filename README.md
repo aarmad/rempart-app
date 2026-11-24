@@ -522,3 +522,36 @@ Le logout ne se contente pas d'effacer le cookie : il **supprime la session du
 serveur**, donc l'identifiant ne vaut plus rien meme si un attaquant en avait une
 copie. Les sessions ont une **expiration** (`expiresAt`, TTL 1 h) et un balayage
 periodique nettoie celles qui ont expire.
+
+## Controle d'acces par role (defense)
+
+Deux roles : `user` (par defaut a l'inscription) et `admin` (compte de demo).
+Le controle se fait **cote serveur**, pas en masquant un lien.
+
+### La garde (refus par defaut sur tout /admin)
+
+```js
+// server.js : montee sur le PREFIXE /admin -> couvre toutes les routes admin,
+// meme futures. Une nouvelle route /admin/... est fermee tant qu'on ne
+// l'ouvre pas (refus par defaut).
+app.use('/admin', async (req, res, next) => {
+  const user = await loadUser(req);                 // session serveur -> user
+  if (!user)                 return res.status(401).json({ ok:false, error:'authentification requise' });
+  if (user.role !== 'admin') return res.status(403).json({ ok:false, error:'acces refuse : role admin requis' });
+  req.user = user;
+  next();
+});
+```
+
+### Ce que renvoie la route admin selon le role
+
+| Appelant | `GET /admin` | `GET /admin/users` | `GET /admin/route-neuve` |
+| --- | --- | --- | --- |
+| Non connecte | `401` | `401` | `401` |
+| Simple utilisateur | **`403` acces refuse** | **`403`** | **`403`** (refus par defaut) |
+| Admin | `200` | `200` + liste | `404` (route non definie, mais pas bloquee) |
+
+La derniere colonne montre le **refus par defaut** : meme une route inexistante
+sous `/admin` renvoie `403` a un simple utilisateur, car la garde s'applique au
+prefixe entier avant tout. Rien n'est seulement "masque" : c'est le serveur qui
+refuse. Couvert par un test automatise (`test/security.test.js`).

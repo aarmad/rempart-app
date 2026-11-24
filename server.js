@@ -459,6 +459,54 @@ form{margin:.5rem 0 1.5rem}</style></head>
   } catch (err) { next(err); }
 });
 
+// ========================================================================
+//  CONTROLE D'ACCES PAR ROLE (cote serveur)
+//  Deux roles : 'user' (defaut) et 'admin'.
+//  Tout ce qui est sous /admin est REFUSE PAR DEFAUT : la garde s'applique
+//  au prefixe entier, donc une nouvelle route /admin/... est fermee tant
+//  qu'on ne l'ouvre pas explicitement a un admin.
+// ========================================================================
+
+// Charge l'utilisateur courant (id, email, role) depuis la session serveur.
+async function loadUser(req) {
+  const s = getSession(parseCookies(req).session);
+  if (!s) return null;
+  const r = await pool.query(
+    'SELECT id, email, role FROM app_users WHERE id = $1', [s.userId]);
+  return r.rows[0] || null;
+}
+
+// GARDE : exige une session valide ET le role admin. C'EST ICI le controle.
+// Montee sur le prefixe '/admin' -> couvre toutes les routes admin, meme
+// futures (refus par defaut).
+app.use('/admin', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) {
+      return res.status(401).json({ ok: false, error: 'authentification requise' });
+    }
+    if (user.role !== 'admin') {
+      // Un simple utilisateur est REFUSE par le serveur (403), pas juste masque.
+      return res.status(403).json({ ok: false, error: 'acces refuse : role admin requis' });
+    }
+    req.user = user;
+    next();
+  } catch (err) { next(err); }
+});
+
+// Page admin (atteinte uniquement si la garde ci-dessus a laisse passer).
+app.get('/admin', (req, res) => {
+  res.json({ ok: true, section: 'admin', vous: req.user.email, role: req.user.role });
+});
+
+// Route admin : liste des utilisateurs (donnee sensible, reservee aux admins).
+app.get('/admin/users', async (req, res, next) => {
+  try {
+    const r = await pool.query('SELECT id, email, role FROM app_users ORDER BY id');
+    res.json({ ok: true, users: r.rows });
+  } catch (err) { next(err); }
+});
+
 // Cree une session serveur et pose le cookie durci.
 //   HttpOnly  : inaccessible au JavaScript (anti-vol par XSS)
 //   SameSite=Lax : pas envoye sur les requetes cross-site (anti-CSRF)
