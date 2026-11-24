@@ -31,3 +31,18 @@ CREATE TABLE IF NOT EXISTS notes (
   user_id INTEGER NOT NULL REFERENCES app_users(id),
   text    TEXT NOT NULL
 );
+
+-- 2FA TOTP : secret CHIFFRE au repos (jamais en clair en base).
+CREATE TABLE IF NOT EXISTS user_totp (
+  user_id INTEGER PRIMARY KEY REFERENCES app_users(id),
+  secret_enc TEXT NOT NULL,          -- secret base32, chiffre (AES-256-GCM)
+  enabled    BOOLEAN NOT NULL DEFAULT false
+);
+
+-- Codes de secours : HACHES comme des mots de passe (bcrypt), a usage unique.
+CREATE TABLE IF NOT EXISTS backup_codes (
+  id        SERIAL PRIMARY KEY,
+  user_id   INTEGER NOT NULL REFERENCES app_users(id),
+  code_hash TEXT NOT NULL,
+  used_at   TIMESTAMPTZ
+);

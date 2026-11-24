@@ -26,6 +26,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
   -- notes : lecture, insertion et modification (par le proprietaire). Pas de DELETE.
   GRANT SELECT, INSERT, UPDATE ON notes TO ${APP_DB_USER};
   GRANT USAGE, SELECT ON SEQUENCE notes_id_seq TO ${APP_DB_USER};
+
+  -- 2FA : secret TOTP (chiffre) et codes de secours (haches).
+  GRANT SELECT, INSERT, UPDATE ON user_totp TO ${APP_DB_USER};
+  GRANT SELECT, INSERT, UPDATE ON backup_codes TO ${APP_DB_USER};
+  GRANT USAGE, SELECT ON SEQUENCE backup_codes_id_seq TO ${APP_DB_USER};
 EOSQL
 
 echo "Role applicatif ${APP_DB_USER} cree (lecture seule)."

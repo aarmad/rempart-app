@@ -5,8 +5,26 @@
 // Pre-requis : l'app tourne (docker compose up). URL configurable via BASE_URL.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 
 const BASE = process.env.BASE_URL || 'http://localhost:8000';
+
+// Generateur TOTP (RFC 6238) pour tester la 2FA.
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Decode(s) {
+  s = s.toUpperCase(); let bits = 0, v = 0; const o = [];
+  for (const c of s) { const i = B32.indexOf(c); if (i < 0) continue; v = (v << 5) | i; bits += 5; if (bits >= 8) { o.push((v >>> (bits - 8)) & 255); bits -= 8; } }
+  return Buffer.from(o);
+}
+function totp(secretB32) {
+  const sec = base32Decode(secretB32);
+  const ctr = Math.floor(Date.now() / 1000 / 30);
+  const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(ctr));
+  const h = crypto.createHmac('sha1', sec).update(b).digest();
+  const off = h[19] & 15;
+  const bin = ((h[off] & 127) << 24) | ((h[off + 1] & 255) << 16) | ((h[off + 2] & 255) << 8) | (h[off + 3] & 255);
+  return String(bin % 1000000).padStart(6, '0');
+}
 
 // Jeton CSRF (double-submit) : toute requete qui MODIFIE doit presenter le
 // meme jeton en cookie ET en entete. On en fixe un pour les tests.
@@ -170,4 +188,44 @@ test('CSRF : POST sans jeton -> 403, avec jeton -> passe la barriere', async () 
     body: JSON.stringify({ email: 'demo@rempart.local', password: 'Demo#1234' }),
   }));
   assert.notEqual(withTok.status, 403, 'avec jeton CSRF -> pas de blocage CSRF');
+});
+
+// --- 9) 2FA TOTP : exigee a la connexion une fois activee ----------------
+test('2FA : activation par code, puis login exige le code TOTP', async () => {
+  const email = `tf-${Date.now()}@test.local`;
+  const pw = 'motdepasse1234';
+  // Inscription (ouvre une session).
+  const reg = await fetch(`${BASE}/register`, mut({
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: pw }),
+  }));
+  const cookie = firstCookie(reg);
+
+  // Page d'activation : on recupere le secret affiche (comme un scan de QR).
+  const html = await fetch(`${BASE}/2fa/setup`, { headers: { Cookie: cookie } }).then((r) => r.text());
+  const secret = (html.match(/<code>([A-Z2-7]+)<\/code>/) || [])[1];
+  assert.ok(secret, 'un secret TOTP doit etre propose');
+
+  // Confirmation avec un premier code valide.
+  const confirm = await fetch(`${BASE}/2fa/confirm`, mut({
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: totp(secret) }),
+  }, cookie)).then((r) => r.json());
+  assert.equal(confirm.enabled, true, '2FA doit etre activee');
+  assert.equal(confirm.backup_codes.length, 8, 'des codes de secours sont fournis');
+
+  // Login SANS code -> refuse (need2fa).
+  const noCode = await fetch(`${BASE}/login`, mut({
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: pw }),
+  }));
+  assert.equal(noCode.status, 401, 'sans 2e facteur -> refus');
+  assert.equal((await noCode.json()).need2fa, true);
+
+  // Login AVEC le bon code TOTP -> autorise.
+  const withCode = await fetch(`${BASE}/login`, mut({
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: pw, code: totp(secret) }),
+  }));
+  assert.equal(withCode.status, 200, 'avec le bon code TOTP -> connexion');
 });

@@ -4,6 +4,7 @@ const path = require('path');
 const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
+const QRCode = require('qrcode');
 const { Pool } = require('pg');
 
 const app = express();
@@ -18,6 +19,11 @@ const SESSION_TTL_MS = 3600 * 1000;   // expiration de session : 1 h
 // Flag Secure du cookie : a activer en production (HTTPS). En local (http),
 // un cookie Secure ne serait pas renvoye par le navigateur.
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
+
+// Cle de chiffrement des secrets TOTP au repos (AES-256-GCM, 32 octets).
+const TOTP_ENC_KEY = Buffer.from(
+  process.env.TOTP_ENC_KEY || '0'.repeat(64), 'hex');
+const TOTP_WINDOW = 1; // tolerance d'horloge : +/- 1 pas de 30 s
 
 // Politique de mot de passe : LONGUEUR minimale, aucune regle de complexite
 // (conforme aux recommandations modernes type NIST : longueur > complexite).
@@ -146,6 +152,59 @@ function safeEqualStr(a, b) {
   const ba = Buffer.from(String(a));
   const bb = Buffer.from(String(b));
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+// ---- 2FA TOTP (RFC 6238) + chiffrement du secret au repos ----------------
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(buf) {
+  let bits = 0, value = 0, out = '';
+  for (const b of buf) {
+    value = (value << 8) | b; bits += 8;
+    while (bits >= 5) { out += B32[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+function base32Decode(str) {
+  str = str.replace(/=+$/, '').toUpperCase();
+  let bits = 0, value = 0; const out = [];
+  for (const c of str) {
+    const i = B32.indexOf(c); if (i < 0) continue;
+    value = (value << 5) | i; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return Buffer.from(out);
+}
+// HOTP (RFC 4226) puis TOTP (pas de 30 s).
+function hotp(secret, counter, digits = 6) {
+  const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(counter));
+  const h = crypto.createHmac('sha1', secret).update(b).digest();
+  const o = h[19] & 0xf;
+  const bin = ((h[o] & 0x7f) << 24) | ((h[o + 1] & 0xff) << 16) |
+              ((h[o + 2] & 0xff) << 8) | (h[o + 3] & 0xff);
+  return String(bin % 10 ** digits).padStart(digits, '0');
+}
+// Verifie un code TOTP avec une tolerance d'horloge (+/- TOTP_WINDOW pas).
+function verifyTotp(secretB32, token) {
+  const secret = base32Decode(secretB32);
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  for (let w = -TOTP_WINDOW; w <= TOTP_WINDOW; w++) {
+    if (safeEqualStr(hotp(secret, counter + w), String(token))) return true;
+  }
+  return false;
+}
+// Chiffre / dechiffre le secret TOTP (AES-256-GCM) : jamais en clair en base.
+function encryptSecret(plain) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', TOTP_ENC_KEY, iv);
+  const enc = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+  return [iv.toString('hex'), c.getAuthTag().toString('hex'), enc.toString('hex')].join(':');
+}
+function decryptSecret(stored) {
+  const [ivH, tagH, dataH] = stored.split(':');
+  const d = crypto.createDecipheriv('aes-256-gcm', TOTP_ENC_KEY, Buffer.from(ivH, 'hex'));
+  d.setAuthTag(Buffer.from(tagH, 'hex'));
+  return Buffer.concat([d.update(Buffer.from(dataH, 'hex')), d.final()]).toString('utf8');
 }
 
 // Echappe une donnee pour l'inserer comme TEXTE dans du HTML.
@@ -446,6 +505,22 @@ app.post('/login', async (req, res, next) => {
       return reply(req, res, 401, { ok: false, error: 'identifiants invalides' });
     }
 
+    // --- 2e facteur : si la 2FA est activee, exiger un code TOTP ou de secours.
+    const totp = (await pool.query(
+      'SELECT secret_enc, enabled FROM user_totp WHERE user_id = $1', [user.id])).rows[0];
+    if (totp && totp.enabled) {
+      const code = (req.body?.code || '').toString().trim();
+      if (!code) {
+        return reply(req, res, 401, { ok: false, need2fa: true, error: 'code 2FA requis' });
+      }
+      const okTotp = verifyTotp(decryptSecret(totp.secret_enc), code);
+      const okBackup = okTotp ? false : await consumeBackupCode(user.id, code);
+      if (!okTotp && !okBackup) {
+        recordFail(emailKey); recordFail(ipKey);
+        return reply(req, res, 401, { ok: false, need2fa: true, error: 'code 2FA invalide' });
+      }
+    }
+
     resetFails(emailKey); // succes : on remet le compteur du compte a zero
     startSession(res, user.id);
     return reply(req, res, 200,
@@ -454,6 +529,21 @@ app.post('/login', async (req, res, next) => {
     next(err);
   }
 });
+
+// Verifie un code de secours (compare bcrypt sur les codes NON utilises) et,
+// s'il correspond, le marque consomme (usage unique). Renvoie true/false.
+async function consumeBackupCode(userId, code) {
+  const rows = (await pool.query(
+    'SELECT id, code_hash FROM backup_codes WHERE user_id = $1 AND used_at IS NULL',
+    [userId])).rows;
+  for (const row of rows) {
+    if (await bcrypt.compare(code, row.code_hash)) {
+      await pool.query('UPDATE backup_codes SET used_at = now() WHERE id = $1', [row.id]);
+      return true;
+    }
+  }
+  return false;
+}
 
 // --- Deconnexion ----------------------------------------------------------
 app.post('/logout', (req, res) => {
@@ -488,6 +578,7 @@ app.get('/account', async (req, res, next) => {
     }
     const body = who
       ? `<p>Connecte en <strong>${escapeHtml(who)}</strong>.</p>
+         <p><a href="/2fa/setup">Activer la double authentification (2FA)</a></p>
          <form method="post" action="/logout">${hidden}<button>Se deconnecter</button></form>`
       : `<h2>Inscription</h2>
          <form method="post" action="/register">${hidden}
@@ -629,6 +720,85 @@ app.put('/notes/:id', async (req, res, next) => {
       return res.status(403).json({ ok: false, error: 'acces refuse : ce n est pas votre ressource' });
     }
     res.json({ ok: true, note: r.rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ========================================================================
+//  2FA TOTP : activation par QR code, confirmee par un premier code.
+// ========================================================================
+
+// Page d'activation : genere un secret (en attente), affiche le QR a scanner.
+app.get('/2fa/setup', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.redirect(303, '/account');
+    const csrf = ensureCsrf(req, res);
+
+    // Nouveau secret aleatoire (20 octets) -> base32 pour les applis d'authentif.
+    const secretB32 = base32Encode(crypto.randomBytes(20));
+    // Stocke CHIFFRE, en attente de confirmation (enabled=false).
+    await pool.query(
+      `INSERT INTO user_totp (user_id, secret_enc, enabled) VALUES ($1, $2, false)
+       ON CONFLICT (user_id) DO UPDATE SET secret_enc = $2, enabled = false`,
+      [user.id, encryptSecret(secretB32)]
+    );
+    const label = encodeURIComponent(`Rempart:${user.email}`);
+    const otpauth = `otpauth://totp/${label}?secret=${secretB32}&issuer=Rempart&period=30&digits=6`;
+    const qr = await QRCode.toDataURL(otpauth);
+
+    res.type('html').send(`<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Activer la 2FA - Rempart</title>
+<style>body{font:16px system-ui,sans-serif;background:#0f1222;color:#e8e8f0;
+margin:0;padding:2rem}a{color:#ff9a62}code{background:#1b2040;padding:.1rem .3rem;border-radius:4px}
+input{padding:.4rem;margin:.3rem 0}</style></head>
+<body>
+  <p><a href="/account">&larr; Compte</a></p>
+  <h1>Activer la double authentification</h1>
+  <p>1. Scanne ce QR code avec ton application d'authentification :</p>
+  <img src="${qr}" alt="QR code TOTP" width="200" height="200">
+  <p>Ou saisis la cle manuellement : <code>${escapeHtml(secretB32)}</code></p>
+  <p>2. Entre le code affiche par l'application pour confirmer :</p>
+  <form method="post" action="/2fa/confirm">
+    <input type="hidden" name="_csrf" value="${csrf}">
+    <input name="code" inputmode="numeric" placeholder="123456" required>
+    <button>Confirmer</button>
+  </form>
+</body></html>`);
+  } catch (err) { next(err); }
+});
+
+// Confirmation : verifie le premier code, active la 2FA, genere les codes de secours.
+app.post('/2fa/confirm', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.status(401).json({ ok: false, error: 'authentification requise' });
+    const code = (req.body?.code || '').toString();
+
+    const row = (await pool.query(
+      'SELECT secret_enc FROM user_totp WHERE user_id = $1', [user.id])).rows[0];
+    if (!row) return res.status(400).json({ ok: false, error: 'aucune activation en cours' });
+
+    const secretB32 = decryptSecret(row.secret_enc);
+    if (!verifyTotp(secretB32, code)) {
+      return res.status(400).json({ ok: false, error: 'code invalide' });
+    }
+    await pool.query('UPDATE user_totp SET enabled = true WHERE user_id = $1', [user.id]);
+
+    // Codes de secours : generes une fois, HACHES (bcrypt) en base, montres ici.
+    await pool.query('DELETE FROM backup_codes WHERE user_id = $1', [user.id]).catch(() => {});
+    const codes = [];
+    for (let i = 0; i < 8; i++) {
+      const plain = crypto.randomBytes(5).toString('hex'); // 10 caracteres
+      codes.push(plain);
+      await pool.query(
+        'INSERT INTO backup_codes (user_id, code_hash) VALUES ($1, $2)',
+        [user.id, await bcrypt.hash(plain, BCRYPT_ROUNDS)]
+      );
+    }
+    res.json({ ok: true, enabled: true, backup_codes: codes,
+      note: 'Garde ces codes de secours en lieu sur : ils ne seront plus jamais affiches.' });
   } catch (err) { next(err); }
 });
 

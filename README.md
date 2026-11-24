@@ -659,3 +659,46 @@ d'une URL piegee chargee par la victime pour la declencher avec ses cookies —
 exactement la faille CSRF du lab DVWA (`?password_new=...` en GET). Garder les
 GET sans effet de bord, et exiger un jeton CSRF sur les POST/PUT, ferme cette
 porte.
+
+## Double authentification TOTP (defense legendaire)
+
+2FA par application d'authentification (TOTP, RFC 6238 — interoperable avec
+Google Authenticator, verifie contre les vecteurs de test officiels).
+
+| Objectif | Mise en oeuvre |
+| --- | --- |
+| Activation par QR code, confirmee | `GET /2fa/setup` genere un secret et un QR (`otpauth://`), `POST /2fa/confirm` valide un premier code avant d'activer |
+| Code demande a la connexion | `/login` exige un code TOTP si la 2FA est active, avec tolerance +/- 30 s (`TOTP_WINDOW`) |
+| Codes de secours haches | 8 codes generes a l'activation, **haches bcrypt**, a **usage unique** (`used_at`) |
+
+### Flux verifie (test automatise, test 10)
+
+```
+register -> /2fa/setup (QR) -> /2fa/confirm (1er code) -> 8 codes de secours
+login SANS code         -> 401 need2fa
+login mauvais code      -> 401
+login bon code TOTP     -> 200
+login code de secours   -> 200
+reutilisation du meme code de secours -> 401 (usage unique)
+```
+
+### Ou est stocke le secret TOTP ? Et si l'utilisateur perd son telephone ?
+
+**Ou est stocke le secret** : cote serveur, en base (table `user_totp`), et
+**chiffre au repos** (AES-256-GCM, cle `TOTP_ENC_KEY`). Jamais en clair :
+
+```
+user_id | secret_enc (iv:tag:donnees chiffrees)       | enabled
+   2     | d3d74b462d7db9893a787a35:6fa80298983c2...   |   t
+```
+
+Le secret n'est lisible que par le serveur au moment de verifier un code ; un
+dump de la base ne le revele pas sans la cle. (L'appli d'authentification du
+telephone en garde sa propre copie, obtenue au scan du QR.)
+
+**Si l'utilisateur perd son telephone** : il ne peut plus generer de codes TOTP.
+Il se connecte alors avec un **code de secours** (les 8 montres une seule fois a
+l'activation). Chaque code est a **usage unique** (marque `used_at`) et stocke
+**hache** (bcrypt), comme un mot de passe : un vol de base ne les rend pas
+utilisables. Une fois reconnecte, il peut re-scanner un nouveau QR pour
+re-associer un telephone (ce qui remplace le secret et regenere des codes).
