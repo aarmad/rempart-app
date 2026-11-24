@@ -9,53 +9,99 @@ une base Postgres, le tout lance par Docker Compose en une commande.
 - PostgreSQL (base de donnees)
 - Docker Compose (orchestration)
 
-## HTTPS en local (Caddy + mkcert)
-
-L'app est servie en HTTPS par un reverse proxy **Caddy**, avec des certificats
-**mkcert** (autorite de certification locale de confiance). Caddy redirige
-HTTP -> HTTPS et envoie l'en-tete HSTS.
-
-Mise en place (une fois) :
-
-```bash
-# 1. Installer mkcert (Windows : winget install FiloSottile.mkcert)
-# 2. Installer la CA locale dans le magasin de confiance (navigateur) :
-mkcert -install
-# 3. Generer les certificats localhost (dans certs/, ignores par git) :
-mkcert -cert-file certs/localhost.pem -key-file certs/localhost-key.pem localhost 127.0.0.1 ::1
-# 4. Lancer :
-docker compose up -d
-```
-
-Acces : `https://localhost` (Caddy, HTTPS) ; `http://localhost` redirige vers HTTPS.
-L'app reste aussi accessible en direct sur `http://localhost:8000` (pratique pour
-les tests). Les certificats (`certs/*.pem`) ne sont jamais commites.
-
-Verifications :
-
-```
-curl -k https://localhost/                      # page servie en HTTPS
-curl -D - http://localhost/  | grep -i location # -> 308 vers https://localhost/
-curl -k -D - https://localhost/ | grep -i strict-transport
-# -> Strict-Transport-Security: max-age=31536000; includeSubDomains
-```
-
 ## Demarrage rapide
 
 ```bash
 # 1. Preparer les secrets locaux
 cp .env.example .env
-# puis editer .env et mettre un vrai mot de passe
+# Renseigner les deux mots de passe et TOTP_ENC_KEY (openssl rand -hex 32)
 
-# 2. Construire et lancer
-docker compose up --build
+# 2. Créer le certificat local avec mkcert
+mkdir -p certs
+mkcert -cert-file certs/localhost.pem -key-file certs/localhost-key.pem localhost
+cp "$(mkcert -CAROOT)/rootCA.pem" certs/rootCA.pem
 
-# 3. Verifier
-#   Page de garde : http://localhost:8000
-#   Sante + base  : http://localhost:8000/health
+# 3. Construire et lancer
+docker compose up --build -d
+
+# 4. Vérifier la redirection et le HTTPS (dont l'en-tête HSTS)
+curl -I http://localhost/health
+curl --cacert certs/rootCA.pem -i https://localhost/health
 ```
 
+Pour faire confiance à cette autorité locale dans le navigateur, exécuter
+`mkcert -install` avec le même `CAROOT` que celui utilisé pour créer le certificat.
+
 Arreter : `docker compose down` (ajouter `-v` pour supprimer aussi les donnees).
+
+## Suppression du compte
+
+Dans /account, la section « Supprimer mon compte » demande le mot de passe
+actuel et une confirmation explicite. Le formulaire utilise la protection
+CSRF de l'application. PostgreSQL efface dans la même opération le compte,
+ses notes, sa configuration 2FA, ses codes de secours, ses sessions et les
+fichiers déposés pendant une session. Les dépôts anonymes ne sont associés
+à aucun compte.
+
+Sur un volume PostgreSQL déjà initialisé, appliquer la migration avant de
+redémarrer le service applicatif :
+
+    docker compose exec -T db sh /docker-entrypoint-initdb.d/03-account-erasure.sh
+    docker compose up -d --build
+
+Sur une base neuve, la migration est exécutée au premier démarrage.
+
+## Chiffrement du secret TOTP et rotation
+
+Le champ `user_totp.secret_enc` est chiffré en AES-256-GCM. Chaque écriture
+génère un nonce aléatoire de 96 bits et stocke le nonce, le tag
+d’authentification et le chiffré avec l’identifiant de la clé. La clé
+`TOTP_ENC_KEY` est injectée depuis l’environnement. Une clé de 32 octets
+est obligatoire. L’application accepte le format antérieur avec la clé
+actuelle.
+
+Prévoir une rotation annuelle et une rotation immédiate en cas de suspicion
+de compromission. Garder une sauvegarde protégée et la clé actuelle dans le
+coffre le temps de vérifier la rotation.
+
+1. Générer une clé dans un fichier temporaire ignoré par Git et Docker.
+
+   ```sh
+   (umask 077 && openssl rand -hex 32 > .env.totp-next)
+   ```
+
+2. Arrêter toutes les instances de l’application puis rechiffrer les secrets
+   en une transaction. PostgreSQL doit rester en service.
+
+   ```sh
+   docker compose stop app
+   docker compose run --rm --no-deps -T app node scripts/rotate-totp-key.js < .env.totp-next
+   ```
+
+3. Après confirmation de la transaction, remplacer `TOTP_ENC_KEY` dans le
+   fichier `.env` par la nouvelle valeur et relancer l’application.
+
+   ```sh
+   docker compose up -d app
+   ```
+
+4. Vérifier `/health` et une connexion 2FA. Supprimer le fichier temporaire.
+   Conserver l’ancienne clé sous accès restreint uniquement tant qu’une
+   sauvegarde qui la nécessite est conservée. Si les secrets TOTP ont pu
+   être lus, demander aux utilisateurs concernés de réenrôler leur 2FA.
+
+Une erreur avant validation annule les modifications. Si le script s’arrête
+après validation et avant la mise à jour de `.env`, laisser l’application
+arrêtée. On peut relancer le script avec les mêmes clés ou terminer la
+mise à jour de la configuration.
+
+## Confidentialité
+
+La page `/confidentialite` décrit les usages et durées de conservation de
+cette instance locale. Définir `PRIVACY_CONTACT_EMAIL` dans `.env` pour
+publier une adresse de contact. Pour une instance déployée, renseigner le
+responsable du traitement et valider les bases légales et les durées
+applicables avant publication.
 
 ## Points de controle
 

@@ -131,7 +131,7 @@ test('route admin : 403 pour un simple utilisateur, 200 pour un admin', async ()
   const email = `u-${Date.now()}@test.local`;
   const reg = await fetch(`${BASE}/register`, mut({
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password: 'motdepasse1234' }),
+    body: JSON.stringify({ email, password: crypto.randomUUID() }),
   }));
   const userCookie = firstCookie(reg);
   const asUser = await fetch(`${BASE}/admin`, { headers: { Cookie: userCookie } });
@@ -151,7 +151,7 @@ test('la note d un utilisateur renvoie 403 a un autre, et pas de mass assignment
   const mkUser = async (email) => {
     const r = await fetch(`${BASE}/register`, mut({
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password: 'motdepasse1234' }),
+      body: JSON.stringify({ email, password: crypto.randomUUID() }),
     }));
     return firstCookie(r);
   };
@@ -193,7 +193,7 @@ test('CSRF : POST sans jeton -> 403, avec jeton -> passe la barriere', async () 
 // --- 9) 2FA TOTP : exigee a la connexion une fois activee ----------------
 test('2FA : activation par code, puis login exige le code TOTP', async () => {
   const email = `tf-${Date.now()}@test.local`;
-  const pw = 'motdepasse1234';
+  const pw = crypto.randomUUID();
   // Inscription (ouvre une session).
   const reg = await fetch(`${BASE}/register`, mut({
     method: 'POST', headers: { 'Content-Type': 'application/json' },

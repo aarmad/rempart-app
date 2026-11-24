@@ -1,5 +1,13 @@
 node_modules
 npm-debug.log
 .env
+.env.*
 .git
 uploads
+certs
+
+# Fichiers de cookies créés par les exemples curl.
+admin.txt
+alice.txt
+bob.txt
+u.txt

@@ -1,31 +1,28 @@
 services:
-  # Caddy : reverse proxy HTTPS (certificats mkcert) + redirection HTTP->HTTPS + HSTS.
   caddy:
-    image: caddy:2.8.4-alpine
+    image: caddy:2-alpine
     ports:
-      - "80:80"
-      - "443:443"
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./certs:/certs:ro
+      - ./certs/localhost.pem:/etc/caddy/localhost.pem:ro
+      - ./certs/localhost-key.pem:/etc/caddy/localhost-key.pem:ro
     depends_on:
       - app
 
   app:
     build: .
-    ports:
-      - "8000:8000"
     environment:
       - PORT=8000
       # Mode debug coupe hors developpement : pas de trace technique renvoyee.
       - NODE_ENV=production
-      # L'app se connecte avec le compte applicatif au moindre privilege,
+      - COOKIE_SECURE=true
+      - TOTP_ENC_KEY=${TOTP_ENC_KEY:?Renseigner TOTP_ENC_KEY dans .env}
+      - PRIVACY_CONTACT_EMAIL=${PRIVACY_CONTACT_EMAIL:-}
+      # L'app se connecte avec le compte applicatif au moindre privilège,
       # PAS avec le superutilisateur POSTGRES_USER.
       - DATABASE_URL=postgres://${APP_DB_USER}:${APP_DB_PASSWORD}@db:5432/${POSTGRES_DB}
-      # Cookie Secure : true en production (HTTPS), false en local (http).
-      - COOKIE_SECURE=${COOKIE_SECURE:-false}
-      # Cle de chiffrement des secrets TOTP au repos.
-      - TOTP_ENC_KEY=${TOTP_ENC_KEY}
     depends_on:
       db:
         condition: service_healthy
