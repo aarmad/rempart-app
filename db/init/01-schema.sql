@@ -18,12 +18,9 @@ INSERT INTO products (name, price) VALUES
 CREATE TABLE IF NOT EXISTS app_users (
   id        SERIAL PRIMARY KEY,
   email     TEXT UNIQUE NOT NULL,
-  pass_hash TEXT NOT NULL,   -- format "salt:hash" (scrypt), jamais en clair
+  pass_hash TEXT NOT NULL,   -- hash bcrypt ($2a$...), jamais le mot de passe en clair
   role      TEXT NOT NULL DEFAULT 'user'
 );
 
--- Utilisateur de demo. Mot de passe : Demo#1234 (hash scrypt ci-dessous).
-INSERT INTO app_users (email, pass_hash, role) VALUES
-  ('demo@rempart.local',
-   '1d1218831f3284e47150138cd1f5492b:f45c100733220a187d4b142ea2d121a70c69fed7ad8bac68f20094b1ccfcd95fd3c56e6fa8515492180e5fb6059c6d757bc458bb82d13a05323c2b8b3746a506',
-   'admin');
+-- L'utilisateur de demo est cree au demarrage par l'app (hash bcrypt calcule
+-- a l'execution), pas seme ici : aucun hash en dur dans le depot.

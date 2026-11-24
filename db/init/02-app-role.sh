@@ -15,10 +15,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
   GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO ${APP_DB_USER};
   GRANT USAGE ON SCHEMA public TO ${APP_DB_USER};
 
-  -- Moindre privilege : lecture seule sur les deux tables de demo.
-  GRANT SELECT ON products, app_users TO ${APP_DB_USER};
+  -- Moindre privilege : products en LECTURE SEULE.
+  GRANT SELECT ON products TO ${APP_DB_USER};
 
-  -- On NE donne PAS INSERT/UPDATE/DELETE, ni les droits sur les sequences.
+  -- app_users : lecture + insertion (l'inscription cree des comptes).
+  -- Toujours PAS d'UPDATE ni de DELETE.
+  GRANT SELECT, INSERT ON app_users TO ${APP_DB_USER};
+  GRANT USAGE, SELECT ON SEQUENCE app_users_id_seq TO ${APP_DB_USER};
 EOSQL
 
 echo "Role applicatif ${APP_DB_USER} cree (lecture seule)."

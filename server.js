@@ -3,14 +3,18 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
+const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 
 const app = express();
 app.disable('x-powered-by');          // ne pas divulguer le moteur (Express)
 app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // formulaires HTML
 const port = process.env.PORT || 8000;
 // Mode debug coupe hors developpement : vrai uniquement si NODE_ENV=development.
 const isDev = process.env.NODE_ENV === 'development';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-insecure-secret';
+const BCRYPT_ROUNDS = 12;             // cout du hachage (lent volontairement)
 
 // --- Upload verrouille : configuration ------------------------------------
 // Les fichiers sont stockes HORS du dossier public : aucune route statique ne
@@ -113,7 +117,8 @@ app.get('/', (req, res) => {
     <p>Recherche HTML (sortie echappee) :
        <a href="/search?q=clavier">/search?q=clavier</a></p>
     <p>Upload verrouille (JPEG/PNG only) : <a href="/upload">/upload</a></p>
-    <p>Login : <code>POST /login</code> { email, password }</p>
+    <p>Compte (inscription / connexion / deconnexion) :
+       <a href="/account">/account</a></p>
   </main>
 </body>
 </html>`);
@@ -252,39 +257,174 @@ app.get('/files/:id', (req, res) => {
   fs.createReadStream(full).pipe(res);
 });
 
-// --- Login : REQUETE PARAMETREE + verification du mot de passe en code -----
-app.post('/login', async (req, res) => {
-  const email = (req.body?.email || '').toString();
+// ========================================================================
+//  AUTHENTIFICATION : inscription / connexion / deconnexion
+//  - mot de passe hache avec bcrypt (lent + sel integre), jamais en clair
+//  - session via cookie HttpOnly signe (HMAC), pas de mdp dans le cookie
+// ========================================================================
+
+// Signe un jeton de session : "userId.expiration.signature".
+function signSession(userId) {
+  const exp = Date.now() + 3600 * 1000; // 1 h
+  const data = `${userId}.${exp}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex');
+  return `${data}.${sig}`;
+}
+
+// Verifie le jeton et renvoie l'userId, ou null.
+function verifySession(token) {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [userId, exp, sig] = parts;
+  const expected = crypto
+    .createHmac('sha256', SESSION_SECRET).update(`${userId}.${exp}`).digest('hex');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  if (Date.now() > Number(exp)) return null;
+  return userId;
+}
+
+function parseCookies(req) {
+  const out = {};
+  (req.headers.cookie || '').split(';').forEach((c) => {
+    const i = c.indexOf('=');
+    if (i > -1) out[c.slice(0, i).trim()] = decodeURIComponent(c.slice(i + 1).trim());
+  });
+  return out;
+}
+
+function wantsJson(req) {
+  return (req.headers.accept || '').includes('application/json') ||
+         (req.headers['content-type'] || '').includes('application/json');
+}
+
+// --- Inscription ----------------------------------------------------------
+app.post('/register', async (req, res, next) => {
+  const email = (req.body?.email || '').toString().trim();
   const password = (req.body?.password || '').toString();
   try {
-    // L'email est un PARAMETRE ($1). Meme "' OR '1'='1" est traite comme une
-    // simple chaine a chercher : aucune ligne ne correspond, pas de bypass.
+    if (!email || password.length < 8) {
+      return reply(req, res, 400, { ok: false, error: 'email requis, mot de passe >= 8 caracteres' });
+    }
+    // bcrypt : hachage lent, avec sel genere automatiquement et inclus au hash.
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    // On n'insere QUE le hash. Le mot de passe en clair n'est jamais stocke.
+    const result = await pool.query(
+      'INSERT INTO app_users (email, pass_hash) VALUES ($1, $2) RETURNING id',
+      [email, hash]
+    );
+    // NB : on ne journalise jamais le mot de passe (ni req.body).
+    console.log(`[register] nouvel utilisateur id=${result.rows[0].id}`);
+    startSession(res, result.rows[0].id);
+    return reply(req, res, 201, { ok: true, user: { id: result.rows[0].id, email } }, '/account');
+  } catch (err) {
+    if (err.code === '23505') { // email deja pris (contrainte unique)
+      return reply(req, res, 409, { ok: false, error: 'email deja utilise' });
+    }
+    next(err);
+  }
+});
+
+// --- Connexion ------------------------------------------------------------
+app.post('/login', async (req, res, next) => {
+  const email = (req.body?.email || '').toString().trim();
+  const password = (req.body?.password || '').toString();
+  try {
+    // email = PARAMETRE $1 : "' OR '1'='1" reste une simple chaine, pas de bypass.
     const result = await pool.query(
       'SELECT id, email, pass_hash, role FROM app_users WHERE email = $1',
       [email]
     );
-    if (result.rows.length === 0) {
-      return res.status(401).json({ ok: false, error: 'identifiants invalides' });
-    }
     const user = result.rows[0];
-    if (!verifyPassword(password, user.pass_hash)) {
-      return res.status(401).json({ ok: false, error: 'identifiants invalides' });
+    // bcrypt.compare : rejoue le hash sur la saisie et compare, a temps constant.
+    const okPass = user ? await bcrypt.compare(password, user.pass_hash) : false;
+    if (!user || !okPass) {
+      return reply(req, res, 401, { ok: false, error: 'identifiants invalides' });
     }
-    res.json({ ok: true, user: { id: user.id, email: user.email, role: user.role } });
+    startSession(res, user.id);
+    return reply(req, res, 200,
+      { ok: true, user: { id: user.id, email: user.email, role: user.role } }, '/account');
   } catch (err) {
-    console.error('[login]', err);
-    res.status(500).json({ ok: false, error: 'internal_error' });
+    next(err);
   }
 });
 
-// Verifie un mot de passe contre un hash "salt:hash" (scrypt), a temps constant.
-function verifyPassword(password, stored) {
-  const [salt, hashHex] = String(stored).split(':');
-  if (!salt || !hashHex) return false;
-  const expected = Buffer.from(hashHex, 'hex');
-  const actual = crypto.scryptSync(password, salt, expected.length);
-  return expected.length === actual.length &&
-         crypto.timingSafeEqual(expected, actual);
+// --- Deconnexion ----------------------------------------------------------
+app.post('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+  return reply(req, res, 200, { ok: true }, '/account');
+});
+
+// --- Qui suis-je (etat de session) ---------------------------------------
+app.get('/me', async (req, res, next) => {
+  const userId = verifySession(parseCookies(req).session);
+  if (!userId) return res.status(401).json({ ok: false, error: 'non connecte' });
+  try {
+    const r = await pool.query('SELECT id, email, role FROM app_users WHERE id = $1', [userId]);
+    if (!r.rows[0]) return res.status(401).json({ ok: false, error: 'non connecte' });
+    res.json({ ok: true, user: r.rows[0] });
+  } catch (err) { next(err); }
+});
+
+// --- Page compte (formulaires HTML) --------------------------------------
+app.get('/account', async (req, res, next) => {
+  const userId = verifySession(parseCookies(req).session);
+  try {
+    let who = null;
+    if (userId) {
+      const r = await pool.query('SELECT email FROM app_users WHERE id = $1', [userId]);
+      who = r.rows[0]?.email || null;
+    }
+    const body = who
+      ? `<p>Connecte en <strong>${escapeHtml(who)}</strong>.</p>
+         <form method="post" action="/logout"><button>Se deconnecter</button></form>`
+      : `<h2>Inscription</h2>
+         <form method="post" action="/register">
+           <input name="email" type="email" placeholder="email" required>
+           <input name="password" type="password" placeholder="mot de passe (>= 8)" required>
+           <button>S'inscrire</button>
+         </form>
+         <h2>Connexion</h2>
+         <form method="post" action="/login">
+           <input name="email" type="email" placeholder="email" required>
+           <input name="password" type="password" placeholder="mot de passe" required>
+           <button>Se connecter</button>
+         </form>`;
+    res.type('html').send(`<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compte - Rempart</title>
+<style>body{font:16px system-ui,sans-serif;background:#0f1222;color:#e8e8f0;
+margin:0;padding:2rem}a{color:#ff9a62}input{display:block;margin:.3rem 0;padding:.4rem}
+form{margin:.5rem 0 1.5rem}</style></head>
+<body><p><a href="/">&larr; Accueil</a></p><h1>Compte</h1>${body}</body></html>`);
+  } catch (err) { next(err); }
+});
+
+// Pose le cookie de session signe (HttpOnly : inaccessible au JavaScript).
+function startSession(res, userId) {
+  const token = signSession(userId);
+  res.setHeader('Set-Cookie',
+    `session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600`);
+}
+
+// Repond en JSON (API) ou par une redirection (formulaire HTML).
+function reply(req, res, status, json, redirectTo) {
+  if (wantsJson(req) || !redirectTo) return res.status(status).json(json);
+  return res.redirect(303, redirectTo);
+}
+
+// Cree l'utilisateur de demo au demarrage (hash bcrypt calcule a l'execution).
+async function ensureDemoUser() {
+  const hash = await bcrypt.hash('Demo#1234', BCRYPT_ROUNDS);
+  await pool.query(
+    `INSERT INTO app_users (email, pass_hash, role) VALUES ($1, $2, 'admin')
+     ON CONFLICT (email) DO NOTHING`,
+    ['demo@rempart.local', hash]
+  );
+  console.log('[init] utilisateur de demo pret (demo@rempart.local)');
 }
 
 // 404 : page generique, pas de details sur ce qui existe ou non.
@@ -313,4 +453,5 @@ app.use((err, req, res, next) => {
 
 app.listen(port, () => {
   console.log(`Rempart app en ecoute sur http://localhost:${port}`);
+  ensureDemoUser().catch((e) => console.error('[init] demo user:', e.message));
 });

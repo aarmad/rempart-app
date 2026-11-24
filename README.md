@@ -382,3 +382,60 @@ Chaque test combine deux choses :
    a renvoye quelque chose.
 
 Un `200` ou un "pas d'exception" ne suffisent jamais : on verifie la **valeur**.
+
+## Stockage des mots de passe (defense)
+
+Inscription / connexion / deconnexion sur `GET /account` (formulaires) et en API
+(`POST /register`, `/login`, `/logout`, `GET /me`).
+
+| Mesure | Mise en oeuvre (`server.js`) |
+| --- | --- |
+| Hachage lent + sale | `bcrypt.hash(password, 12)` a l'inscription ; `bcrypt.compare` au login |
+| Jamais de mdp en clair | on insere **uniquement** le hash ; aucun `console.log` du mot de passe ni de `req.body` |
+| Session sans mdp | cookie `HttpOnly` signe (HMAC) contenant `userId.exp.signature`, pas le mot de passe |
+
+### Le hash en base
+
+```
+ id |       email        |              pass_hash (60 car.)              
+----+--------------------+-----------------------------------------------
+  1 | demo@rempart.local | $2a$12$OLtDhZLOlls/4gHUKtILNO...  (bcrypt)
+  2 | alice@test.local   | $2a$12$6DuXrFfoZzKv0pskbnWXdu...  (bcrypt)
+```
+
+Le prefixe `$2a$12$` indique bcrypt avec un cout de 12. Verification :
+
+```bash
+docker compose exec db psql -U rempart -d rempart \
+  -c "SELECT email, pass_hash FROM app_users;"
+# -> aucune ligne ne contient un mot de passe en clair
+```
+
+### Pourquoi lent et sale, et pas SHA-256 ?
+
+- **Sale** : bcrypt genere un **sel aleatoire** par mot de passe, inclus dans le
+  hash. Deux comptes avec le MEME mot de passe `identique123` donnent deux hash
+  differents :
+  ```
+  bob   -> $2a$12$YmqC6WSgQ0o1LwSta.r0oO...
+  carol -> $2a$12$h8egYF0veYKgSFKVpcW0/u...
+  ```
+  Sans sel (SHA-256 brut), ils seraient identiques : un attaquant casse tous les
+  comptes d'un coup avec une **rainbow table** (hash precalcules).
+- **Lent** : SHA-256 est concu pour etre **rapide** -> un GPU teste des milliards
+  de hash/seconde, donc le brute-force d'un mot de passe vole est trivial. bcrypt
+  (cout 12) est **volontairement lent** (~0,1 s par hash) et reglable : le
+  brute-force devient des annees de calcul. Argon2id ajoute en plus une forte
+  consommation memoire pour resister aux GPU/ASIC.
+
+En clair : SHA-256 est une fonction de hachage *generale* (integrite), pas une
+fonction de *stockage de mot de passe*. bcrypt / Argon2id sont faits pour ca :
+sel integre + lenteur reglable.
+
+### Aucun mot de passe en clair, nulle part
+
+```bash
+# en base : 0 ligne contient un mot de passe en clair
+# dans les logs : aucun mot de passe (on ne journalise que l'id de l'utilisateur)
+docker compose logs app | grep -i 'Demo#1234'   # -> rien
+```
