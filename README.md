@@ -555,3 +555,60 @@ La derniere colonne montre le **refus par defaut** : meme une route inexistante
 sous `/admin` renvoie `403` a un simple utilisateur, car la garde s'applique au
 prefixe entier avant tout. Rien n'est seulement "masque" : c'est le serveur qui
 refuse. Couvert par un test automatise (`test/security.test.js`).
+
+## Chacun chez soi : verification du proprietaire (anti-IDOR)
+
+Ressource `notes` : chaque note appartient a un utilisateur (`user_id`). Toute
+lecture / modification verifie le proprietaire **cote serveur**.
+
+### La ligne qui verifie le proprietaire
+
+Lecture (`GET /notes/:id`) :
+
+```js
+const note = (await pool.query(
+  'SELECT id, user_id, text FROM notes WHERE id = $1', [req.params.id])).rows[0];
+if (!note) return res.status(404)...;
+// >>> LA LIGNE QUI VERIFIE LE PROPRIETAIRE <<<
+if (note.user_id !== user.id)
+  return res.status(403).json({ ok:false, error:'acces refuse : ce n est pas votre ressource' });
+```
+
+Modification (`PUT /notes/:id`) : le proprietaire est verifie **dans la requete**
+SQL elle-meme, donc un non-proprietaire ne modifie rien.
+
+```js
+const r = await pool.query(
+  'UPDATE notes SET text = $1 WHERE id = $2 AND user_id = $3 RETURNING ...',
+  [text, req.params.id, user.id]);
+if (r.rowCount === 0) return res.status(403)...; // pas le proprietaire (ou inexistant)
+```
+
+### Preuve avec deux comptes
+
+Alice cree la note `id=1`. Ensuite :
+
+| Action | Resultat |
+| --- | --- |
+| Bob lit `GET /notes/1` | **403** acces refuse |
+| Bob modifie `PUT /notes/1` | **403** (et la note reste intacte) |
+| Alice lit `GET /notes/1` | `200` sa note |
+
+### Pas de mass assignment
+
+A la creation, SEUL `text` est pris. Le proprietaire est l'utilisateur
+**authentifie**, jamais une valeur du body :
+
+```
+POST /notes {"text":"...","user_id":999,"role":"admin","id":1234}
+-> note creee : { id:1, user_id:2, text:"..." }   # user_id=999 et id=1234 IGNORES
+```
+
+### Que se passe-t-il si on enleve la ligne du proprietaire ?
+
+C'est exactement la faille **IDOR** (type View Basket de Juice Shop) : sans le
+`if (note.user_id !== user.id)` (ou le `AND user_id = $3`), n'importe quel
+utilisateur connecte pourrait lire ou modifier la ressource d'un autre en
+changeant simplement l'`id` dans l'URL. La verification du proprietaire est la
+seule chose qui transforme "connecte" (authentification) en "a le droit sur CETTE
+ressource" (autorisation).

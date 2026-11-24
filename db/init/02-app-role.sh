@@ -22,6 +22,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
   -- Toujours PAS d'UPDATE ni de DELETE.
   GRANT SELECT, INSERT ON app_users TO ${APP_DB_USER};
   GRANT USAGE, SELECT ON SEQUENCE app_users_id_seq TO ${APP_DB_USER};
+
+  -- notes : lecture, insertion et modification (par le proprietaire). Pas de DELETE.
+  GRANT SELECT, INSERT, UPDATE ON notes TO ${APP_DB_USER};
+  GRANT USAGE, SELECT ON SEQUENCE notes_id_seq TO ${APP_DB_USER};
 EOSQL
 
 echo "Role applicatif ${APP_DB_USER} cree (lecture seule)."

@@ -507,6 +507,78 @@ app.get('/admin/users', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ========================================================================
+//  RESSOURCES PAR UTILISATEUR (anti-IDOR) : chaque note appartient a un user.
+//  Toute lecture / modification verifie le proprietaire cote serveur.
+// ========================================================================
+
+// Creation : SEUL le champ "text" est accepte (pas de mass assignment).
+// Le proprietaire est l'utilisateur AUTHENTIFIE, jamais une valeur du body.
+app.post('/notes', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.status(401).json({ ok: false, error: 'authentification requise' });
+    const text = (req.body?.text || '').toString();
+    if (!text) return res.status(400).json({ ok: false, error: 'text requis' });
+    // On n'utilise QUE text + user.id. Tout autre champ du body (user_id, id,
+    // role...) est IGNORE : impossible de s'attribuer la note d'un autre.
+    const r = await pool.query(
+      'INSERT INTO notes (user_id, text) VALUES ($1, $2) RETURNING id, user_id, text',
+      [user.id, text]
+    );
+    res.status(201).json({ ok: true, note: r.rows[0] });
+  } catch (err) { next(err); }
+});
+
+// Liste : uniquement SES notes.
+app.get('/notes', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.status(401).json({ ok: false, error: 'authentification requise' });
+    const r = await pool.query(
+      'SELECT id, user_id, text FROM notes WHERE user_id = $1 ORDER BY id', [user.id]);
+    res.json({ ok: true, notes: r.rows });
+  } catch (err) { next(err); }
+});
+
+// Lecture d'une note : verifie le PROPRIETAIRE.
+app.get('/notes/:id', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.status(401).json({ ok: false, error: 'authentification requise' });
+    if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ ok: false, error: 'introuvable' });
+    const r = await pool.query('SELECT id, user_id, text FROM notes WHERE id = $1', [req.params.id]);
+    const note = r.rows[0];
+    if (!note) return res.status(404).json({ ok: false, error: 'introuvable' });
+    // >>> LA LIGNE QUI VERIFIE LE PROPRIETAIRE <<<
+    if (note.user_id !== user.id) {
+      return res.status(403).json({ ok: false, error: 'acces refuse : ce n est pas votre ressource' });
+    }
+    res.json({ ok: true, note });
+  } catch (err) { next(err); }
+});
+
+// Modification : verifie le proprietaire DANS la requete (WHERE user_id = ...),
+// et n'ecrit QUE "text" (pas de mass assignment).
+app.put('/notes/:id', async (req, res, next) => {
+  try {
+    const user = await loadUser(req);
+    if (!user) return res.status(401).json({ ok: false, error: 'authentification requise' });
+    if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ ok: false, error: 'introuvable' });
+    const text = (req.body?.text || '').toString();
+    if (!text) return res.status(400).json({ ok: false, error: 'text requis' });
+    const r = await pool.query(
+      'UPDATE notes SET text = $1 WHERE id = $2 AND user_id = $3 RETURNING id, user_id, text',
+      [text, req.params.id, user.id]
+    );
+    // 0 ligne = la note n'existe pas OU n'appartient pas a l'utilisateur.
+    if (r.rowCount === 0) {
+      return res.status(403).json({ ok: false, error: 'acces refuse : ce n est pas votre ressource' });
+    }
+    res.json({ ok: true, note: r.rows[0] });
+  } catch (err) { next(err); }
+});
+
 // Cree une session serveur et pose le cookie durci.
 //   HttpOnly  : inaccessible au JavaScript (anti-vol par XSS)
 //   SameSite=Lax : pas envoye sur les requetes cross-site (anti-CSRF)

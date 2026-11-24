@@ -24,3 +24,10 @@ CREATE TABLE IF NOT EXISTS app_users (
 
 -- L'utilisateur de demo est cree au demarrage par l'app (hash bcrypt calcule
 -- a l'execution), pas seme ici : aucun hash en dur dans le depot.
+
+-- Ressource appartenant a un utilisateur (demo anti-IDOR).
+CREATE TABLE IF NOT EXISTS notes (
+  id      SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES app_users(id),
+  text    TEXT NOT NULL
+);

@@ -141,3 +141,33 @@ test('route admin : 403 pour un simple utilisateur, 200 pour un admin', async ()
   const asAdmin = await fetch(`${BASE}/admin`, { headers: { Cookie: adminCookie } });
   assert.equal(asAdmin.status, 200, 'un admin doit etre autorise (200)');
 });
+
+// --- 7) Anti-IDOR : chaque ressource verifie son proprietaire -----------
+test('la note d un utilisateur renvoie 403 a un autre, et pas de mass assignment', async () => {
+  const mkUser = async (email) => {
+    const r = await fetch(`${BASE}/register`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: 'motdepasse1234' }),
+    });
+    return (r.headers.get('set-cookie') || '').split(';')[0];
+  };
+  const alice = await mkUser(`alice-${Date.now()}@test.local`);
+  const bob = await mkUser(`bob-${Date.now()}@test.local`);
+
+  // Alice cree une note en tentant un mass assignment (user_id force a 999).
+  const created = await fetch(`${BASE}/notes`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: alice },
+    body: JSON.stringify({ text: 'secret d Alice', user_id: 999, role: 'admin' }),
+  }).then((r) => r.json());
+  // Mass assignment ignore : le proprietaire n'est PAS 999.
+  assert.notEqual(created.note.user_id, 999, 'user_id du body doit etre ignore');
+  const id = created.note.id;
+
+  // Bob ne peut pas lire la note d'Alice.
+  const bobRead = await fetch(`${BASE}/notes/${id}`, { headers: { Cookie: bob } });
+  assert.equal(bobRead.status, 403, 'la ressource d un autre doit renvoyer 403');
+
+  // Alice lit bien la sienne.
+  const aliceRead = await fetch(`${BASE}/notes/${id}`, { headers: { Cookie: alice } });
+  assert.equal(aliceRead.status, 200, 'le proprietaire doit pouvoir lire (200)');
+});
