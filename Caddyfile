@@ -1,9 +1,15 @@
-http://localhost {
-	redir https://localhost{uri} 308
-}
+# Caddy sert l'app en HTTPS avec les certificats mkcert (de confiance locale).
+# Caddy redirige automatiquement HTTP (80) vers HTTPS (443) pour un site nomme.
 
-https://localhost {
-	tls /etc/caddy/localhost.pem /etc/caddy/localhost-key.pem
-	header Strict-Transport-Security "max-age=31536000"
+localhost {
+	# Certificats generes par mkcert (voir README).
+	tls /certs/localhost.pem /certs/localhost-key.pem
+
+	encode gzip
+
+	# HSTS : force le navigateur a n'utiliser que HTTPS pendant 1 an.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Reverse proxy vers l'app Node (reseau interne Compose).
 	reverse_proxy app:8000
 }

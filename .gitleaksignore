@@ -1,6 +1,0 @@
-# Mots de passe des comptes créés à la volée par les tests de sécurité.
-ba375772daacd899b9c3ac474af4c761512e96ed:test/security.test.js:generic-api-key:150
-1a288d9d2a83429d6186e9b9c448dd1ccaaa065b:test/security.test.js:generic-api-key:129
-
-# Texte de remplacement, incompatible avec le format hexadécimal de la clé TOTP.
-22cbaa36f43d6ad27a40d135d282a741cabf177f:.env.example:generic-api-key:17

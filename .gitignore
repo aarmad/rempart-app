@@ -13,11 +13,5 @@ npm-debug.log*
 # Fichiers recus a l execution (pas du code)
 uploads/
 
-# Certificats et clés TLS locaux
-/certs/
-
-# Fichiers de cookies créés par les exemples curl.
-/admin.txt
-/alice.txt
-/bob.txt
-/u.txt
+# Certificats TLS locaux (mkcert) : cles privees, jamais commitees
+certs/*.pem

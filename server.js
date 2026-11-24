@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const { promisify } = require('node:util');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -7,8 +6,6 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const QRCode = require('qrcode');
 const { Pool } = require('pg');
-const { createTotpCipher } = require('./lib/totp-crypto');
-const privacyPage = require('./lib/privacy-page');
 
 const app = express();
 app.disable('x-powered-by');          // ne pas divulguer le moteur (Express)
@@ -24,7 +21,8 @@ const SESSION_TTL_MS = 3600 * 1000;   // expiration de session : 1 h
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 
 // Cle de chiffrement des secrets TOTP au repos (AES-256-GCM, 32 octets).
-const totpCipher = createTotpCipher(process.env.TOTP_ENC_KEY);
+const TOTP_ENC_KEY = Buffer.from(
+  process.env.TOTP_ENC_KEY || '0'.repeat(64), 'hex');
 const TOTP_WINDOW = 1; // tolerance d'horloge : +/- 1 pas de 30 s
 
 // Politique de mot de passe : LONGUEUR minimale, aucune regle de complexite
@@ -52,16 +50,6 @@ function resetFails(key) { loginFails.delete(key); }
 // Hash leurre : si l'e-mail n'existe pas, on compare quand meme contre ce hash
 // pour que la reponse prenne le MEME temps (pas de fuite par le timing).
 const DUMMY_HASH = bcrypt.hashSync('dummy-password-not-used', BCRYPT_ROUNDS);
-const scrypt = promisify(crypto.scrypt);
-
-async function verifyPassword(password, hash) {
-  // Les comptes créés avant l'adoption de bcrypt utilisent encore le format scrypt.
-  if (!/^[a-f0-9]{32}:[a-f0-9]{128}$/.test(hash)) return bcrypt.compare(password, hash);
-  const [salt, hex] = hash.split(':');
-  const expected = Buffer.from(hex, 'hex');
-  const actual = await scrypt(password, salt, expected.length);
-  return crypto.timingSafeEqual(expected, actual);
-}
 
 // --- Upload verrouille : configuration ------------------------------------
 // Les fichiers sont stockes HORS du dossier public : aucune route statique ne
@@ -205,6 +193,20 @@ function verifyTotp(secretB32, token) {
   }
   return false;
 }
+// Chiffre / dechiffre le secret TOTP (AES-256-GCM) : jamais en clair en base.
+function encryptSecret(plain) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', TOTP_ENC_KEY, iv);
+  const enc = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+  return [iv.toString('hex'), c.getAuthTag().toString('hex'), enc.toString('hex')].join(':');
+}
+function decryptSecret(stored) {
+  const [ivH, tagH, dataH] = stored.split(':');
+  const d = crypto.createDecipheriv('aes-256-gcm', TOTP_ENC_KEY, Buffer.from(ivH, 'hex'));
+  d.setAuthTag(Buffer.from(tagH, 'hex'));
+  return Buffer.concat([d.update(Buffer.from(dataH, 'hex')), d.final()]).toString('utf8');
+}
+
 // Echappe une donnee pour l'inserer comme TEXTE dans du HTML.
 // (equivalent d'un template qui echappe : < devient &lt;, etc.)
 function escapeHtml(value) {
@@ -249,14 +251,9 @@ app.get('/', (req, res) => {
     <p>Upload verrouille (JPEG/PNG only) : <a href="/upload">/upload</a></p>
     <p>Compte (inscription / connexion / deconnexion) :
        <a href="/account">/account</a></p>
-    <p><a href="/confidentialite">Confidentialité</a></p>
   </main>
 </body>
 </html>`);
-});
-
-app.get('/confidentialite', (req, res) => {
-  res.type('html').send(privacyPage(process.env.PRIVACY_CONTACT_EMAIL));
 });
 
 // Fournit le jeton CSRF (et pose le cookie) : a lire avant toute action.
@@ -346,7 +343,6 @@ margin:0;padding:2rem}a{color:#ff9a62}</style></head>
   <p><a href="/">&larr; Accueil</a></p>
   <h1>Upload verrouille</h1>
   <p>Accepte uniquement JPEG / PNG (contenu verifie), max 2 Mo.</p>
-  <p>Si vous êtes <a href="/account">connecté</a>, le fichier est privé et lié à votre compte.</p>
   <form method="post" action="/upload?_csrf=${csrf}" enctype="multipart/form-data">
     <input type="file" name="file" required>
     <button type="submit">Envoyer</button>
@@ -355,8 +351,8 @@ margin:0;padding:2rem}a{color:#ff9a62}</style></head>
 });
 
 // --- Upload verrouille : reception ----------------------------------------
-app.post('/upload', (req, res, next) => {
-  upload.single('file')(req, res, async (err) => {
+app.post('/upload', (req, res) => {
+  upload.single('file')(req, res, (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(413).json({ ok: false, error: 'fichier trop volumineux (max 2 Mo)' });
@@ -378,49 +374,26 @@ app.post('/upload', (req, res, next) => {
 
     // Renommer : nom aleatoire + extension derivee du CONTENU verifie.
     const stored = crypto.randomBytes(16).toString('hex') + '.' + match.ext;
-    try {
-      const user = await loadUser(req);
-      if (user) {
-        await pool.query(
-          'INSERT INTO account_files (id, user_id, content) VALUES ($1, $2, $3)',
-          [stored, user.id, buf]
-        );
-      } else if (parseCookies(req).session) {
-        return res.status(401).json({ ok: false, error: 'session expirée' });
-      } else {
-        // Les dépôts anonymes existants restent dans leur stockage historique.
-        await fs.promises.writeFile(path.join(UPLOAD_DIR, stored), buf, { flag: 'wx' });
-      }
-      res.json({ ok: true, stored, type: match.type, url: '/files/' + stored });
-    } catch (error) {
-      next(error);
-    }
+    fs.writeFileSync(path.join(UPLOAD_DIR, stored), buf);
+    res.json({ ok: true, stored, type: match.type, url: '/files/' + stored });
   });
 });
 
 // --- Upload verrouille : telechargement sans danger -----------------------
-app.get('/files/:id', async (req, res, next) => {
+app.get('/files/:id', (req, res) => {
   const id = req.params.id;
+  // Nom strict (anti path traversal) : 32 hex + .jpg/.png, rien d'autre.
   if (!/^[a-f0-9]{32}\.(jpg|png)$/.test(id)) return res.status(400).end();
+  const full = path.join(UPLOAD_DIR, id);
+  if (!fs.existsSync(full)) return res.status(404).end();
 
-  try {
-    const session = await getSession(parseCookies(req).session);
-    const { rows } = await pool.query(
-      'SELECT content FROM account_files WHERE id = $1 AND user_id = $2',
-      [id, session?.userId ?? null]
-    );
-    const content = rows[0]?.content;
-    const full = path.join(UPLOAD_DIR, id);
-    if (!content && !fs.existsSync(full)) return res.status(404).end();
-
-    res.setHeader('Content-Type', id.endsWith('.png') ? 'image/png' : 'image/jpeg');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + id + '"');
-    if (content) return res.set('Cache-Control', 'no-store').send(content);
-    fs.createReadStream(full).on('error', next).pipe(res);
-  } catch (error) {
-    next(error);
-  }
+  const type = id.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  res.setHeader('Content-Type', type);
+  // nosniff : le navigateur ne "devine" pas un autre type que celui annonce.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // attachment : le fichier est telecharge, jamais rendu/execute dans la page.
+  res.setHeader('Content-Disposition', `attachment; filename="${id}"`);
+  fs.createReadStream(full).pipe(res);
 });
 
 // ========================================================================
@@ -429,45 +402,33 @@ app.get('/files/:id', async (req, res, next) => {
 //  - session cote SERVEUR : le cookie ne porte qu'un identifiant aleatoire
 // ========================================================================
 
-// Identifiant opaque dans le cookie, seule son empreinte est conservée en base.
-function sessionDigest(sid) {
-  return typeof sid === 'string' && /^[a-f0-9]{64}$/.test(sid)
-    ? crypto.createHash('sha256').update(sid).digest('hex')
-    : null;
-}
+// Store de session cote serveur : sid -> { userId, expiresAt }.
+// Le cookie ne contient qu'un identifiant opaque, aucune donnee sensible.
+const sessions = new Map();
 
-async function createSession(userId) {
+// Cree une NOUVELLE session (id aleatoire) : appele a chaque connexion, donc
+// l'identifiant est REGENERE au login (parade contre la fixation de session).
+function createSession(userId) {
   const sid = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await pool.query(
-    'INSERT INTO app_sessions (sid_hash, user_id, expires_at) VALUES ($1, $2, $3)',
-    [sessionDigest(sid), userId, expiresAt]
-  );
+  sessions.set(sid, { userId, expiresAt: Date.now() + SESSION_TTL_MS });
   return sid;
 }
 
-async function getSession(sid) {
-  const digest = sessionDigest(sid);
-  if (!digest) return null;
-  const { rows } = await pool.query(
-    'SELECT user_id AS "userId" FROM app_sessions WHERE sid_hash = $1 AND expires_at > now()',
-    [digest]
-  );
-  return rows[0] || null;
+// Renvoie la session si elle existe ET n'est pas expiree, sinon null.
+function getSession(sid) {
+  const s = sid && sessions.get(sid);
+  if (!s) return null;
+  if (Date.now() > s.expiresAt) { sessions.delete(sid); return null; } // expiration
+  return s;
 }
 
-async function destroySession(sid) {
-  const digest = sessionDigest(sid);
-  if (digest) await pool.query('DELETE FROM app_sessions WHERE sid_hash = $1', [digest]);
-}
+// Detruit la session COTE SERVEUR (le jeton ne vaut plus rien, meme copie).
+function destroySession(sid) { if (sid) sessions.delete(sid); }
 
+// Balayage periodique des sessions expirees.
 setInterval(() => {
   const now = Date.now();
-  for (const [key, entry] of loginFails) {
-    if (entry.resetAt <= now) loginFails.delete(key);
-  }
-  pool.query('DELETE FROM app_sessions WHERE expires_at <= now()')
-    .catch((error) => console.error('[session cleanup]', error.code));
+  for (const [sid, s] of sessions) if (now > s.expiresAt) sessions.delete(sid);
 }, 10 * 60 * 1000).unref();
 
 function parseCookies(req) {
@@ -503,7 +464,8 @@ app.post('/register', async (req, res, next) => {
       [email, hash]
     );
     // NB : on ne journalise jamais le mot de passe (ni req.body).
-    await startSession(res, result.rows[0].id);
+    console.log(`[register] nouvel utilisateur id=${result.rows[0].id}`);
+    startSession(res, result.rows[0].id);
     return reply(req, res, 201, { ok: true, user: { id: result.rows[0].id, email } }, '/account');
   } catch (err) {
     if (err.code === '23505') { // email deja pris (contrainte unique)
@@ -533,7 +495,7 @@ app.post('/login', async (req, res, next) => {
     const user = result.rows[0];
     // Si l'e-mail n'existe pas, on compare quand meme contre un hash leurre :
     // meme temps de reponse -> impossible de deviner l'existence du compte.
-    const okPass = await verifyPassword(password, user ? user.pass_hash : DUMMY_HASH);
+    const okPass = await bcrypt.compare(password, user ? user.pass_hash : DUMMY_HASH);
 
     if (!user || !okPass) {
       // Echec : on incremente les compteurs, et on renvoie le MEME message
@@ -551,7 +513,7 @@ app.post('/login', async (req, res, next) => {
       if (!code) {
         return reply(req, res, 401, { ok: false, need2fa: true, error: 'code 2FA requis' });
       }
-      const okTotp = verifyTotp(totpCipher.decrypt(totp.secret_enc), code);
+      const okTotp = verifyTotp(decryptSecret(totp.secret_enc), code);
       const okBackup = okTotp ? false : await consumeBackupCode(user.id, code);
       if (!okTotp && !okBackup) {
         recordFail(emailKey); recordFail(ipKey);
@@ -560,15 +522,7 @@ app.post('/login', async (req, res, next) => {
     }
 
     resetFails(emailKey); // succes : on remet le compteur du compte a zero
-    try {
-      await startSession(res, user.id);
-    } catch (error) {
-      // Le compte peut avoir été effacé pendant la vérification du mot de passe.
-      if (error.code === '23503') {
-        return reply(req, res, 401, { ok: false, error: 'identifiants invalides' });
-      }
-      throw error;
-    }
+    startSession(res, user.id);
     return reply(req, res, 200,
       { ok: true, user: { id: user.id, email: user.email, role: user.role } }, '/account');
   } catch (err) {
@@ -592,94 +546,41 @@ async function consumeBackupCode(userId, code) {
 }
 
 // --- Deconnexion ----------------------------------------------------------
-function clearSessionCookie(res) {
-  const secure = COOKIE_SECURE ? '; Secure' : '';
-  res.append('Set-Cookie', 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' + secure);
-}
-
-app.post('/logout', async (req, res, next) => {
-  try {
-    await destroySession(parseCookies(req).session);
-    clearSessionCookie(res);
-    return reply(req, res, 200, { ok: true }, '/account');
-  } catch (error) {
-    next(error);
-  }
+app.post('/logout', (req, res) => {
+  // Destruction COTE SERVEUR : la session est supprimee du store...
+  destroySession(parseCookies(req).session);
+  // ...et le cookie est efface cote navigateur (Max-Age=0).
+  res.setHeader('Set-Cookie', 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+  return reply(req, res, 200, { ok: true }, '/account');
 });
 
+// --- Qui suis-je (etat de session) ---------------------------------------
 app.get('/me', async (req, res, next) => {
+  const userId = getSession(parseCookies(req).session)?.userId;
+  if (!userId) return res.status(401).json({ ok: false, error: 'non connecte' });
   try {
-    const user = await loadUser(req);
-    if (!user) return res.status(401).json({ ok: false, error: 'non connecte' });
-    res.set('Cache-Control', 'no-store').json({ ok: true, user });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post('/account/delete', async (req, res, next) => {
-  try {
-    const session = await getSession(parseCookies(req).session);
-    if (!session) return respondError(req, res, 401, 'Authentification requise.');
-    const { password, confirm } = req.body || {};
-    if (confirm !== 'yes' || typeof password !== 'string' || !password) {
-      return respondError(req, res, 400, 'Confirmez la suppression et saisissez votre mot de passe.');
-    }
-
-    const { rows } = await pool.query(
-      'SELECT email, pass_hash FROM app_users WHERE id = $1', [session.userId]
-    );
-    const user = rows[0];
-    const emailKey = user && 'email:' + user.email.toLowerCase();
-    const ipKey = 'ip:' + req.ip;
-    if (!user) return respondError(req, res, 401, 'Authentification requise.');
-    if (isBlocked(emailKey, MAX_FAILS_PER_ACCOUNT) || isBlocked(ipKey, MAX_FAILS_PER_IP)) {
-      return respondError(req, res, 429, 'Trop de tentatives, réessayez plus tard.');
-    }
-    if (!await verifyPassword(password, user.pass_hash)) {
-      recordFail(emailKey);
-      recordFail(ipKey);
-      return respondError(req, res, 403, 'Mot de passe incorrect.');
-    }
-
-    // Un seul DELETE : les clés étrangères effacent aussi les données liées.
-    const result = await pool.query(
-      'DELETE FROM app_users WHERE id = $1 AND pass_hash = $2', [session.userId, user.pass_hash]
-    );
-    if (!result.rowCount) return respondError(req, res, 401, 'Authentification requise.');
-
-    resetFails(emailKey);
-    clearSessionCookie(res);
-    return reply(req, res, 200, { ok: true }, '/account?deleted=1');
-  } catch (error) {
-    next(error);
-  }
+    const r = await pool.query('SELECT id, email, role FROM app_users WHERE id = $1', [userId]);
+    if (!r.rows[0]) return res.status(401).json({ ok: false, error: 'non connecte' });
+    res.json({ ok: true, user: r.rows[0] });
+  } catch (err) { next(err); }
 });
 
 // --- Page compte (formulaires HTML) --------------------------------------
 app.get('/account', async (req, res, next) => {
-  const csrf = ensureCsrf(req, res);
-  const hidden = `<input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">`;
+  const userId = getSession(parseCookies(req).session)?.userId;
+  const csrf = ensureCsrf(req, res); // jeton CSRF, injecte dans chaque formulaire
+  const hidden = `<input type="hidden" name="_csrf" value="${csrf}">`;
   try {
-    const who = (await loadUser(req))?.email;
-    res.set('Cache-Control', 'no-store');
+    let who = null;
+    if (userId) {
+      const r = await pool.query('SELECT email FROM app_users WHERE id = $1', [userId]);
+      who = r.rows[0]?.email || null;
+    }
     const body = who
       ? `<p>Connecte en <strong>${escapeHtml(who)}</strong>.</p>
          <p><a href="/2fa/setup">Activer la double authentification (2FA)</a></p>
-         <form method="post" action="/logout">${hidden}<button>Se deconnecter</button></form>
-         <h2>Supprimer mon compte</h2>
-         <p>Cette action efface le compte, ses données et ses fichiers, et ferme toutes ses sessions.</p>
-         <form method="post" action="/account/delete">
-           ${hidden}
-           <label for="deletion-password">Mot de passe actuel</label>
-           <input id="deletion-password" name="password" type="password" autocomplete="current-password" required>
-           <label><input name="confirm" type="checkbox" value="yes" required>
-             Je confirme la suppression définitive de mon compte.
-           </label>
-           <button type="submit">Supprimer définitivement mon compte</button>
-         </form>`
-      : `${req.query.deleted === '1' ? '<p role="status">Votre compte a été supprimé.</p>' : ''}
-         <h2>Inscription</h2>
+         <form method="post" action="/logout">${hidden}<button>Se deconnecter</button></form>`
+      : `<h2>Inscription</h2>
          <form method="post" action="/register">${hidden}
            <input name="email" type="email" placeholder="email" required>
            <input name="password" type="password" placeholder="mot de passe (>= 10)" required>
@@ -712,7 +613,7 @@ form{margin:.5rem 0 1.5rem}</style></head>
 
 // Charge l'utilisateur courant (id, email, role) depuis la session serveur.
 async function loadUser(req) {
-  const s = await getSession(parseCookies(req).session);
+  const s = getSession(parseCookies(req).session);
   if (!s) return null;
   const r = await pool.query(
     'SELECT id, email, role FROM app_users WHERE id = $1', [s.userId]);
@@ -839,7 +740,7 @@ app.get('/2fa/setup', async (req, res, next) => {
     await pool.query(
       `INSERT INTO user_totp (user_id, secret_enc, enabled) VALUES ($1, $2, false)
        ON CONFLICT (user_id) DO UPDATE SET secret_enc = $2, enabled = false`,
-      [user.id, totpCipher.encrypt(secretB32)]
+      [user.id, encryptSecret(secretB32)]
     );
     const label = encodeURIComponent(`Rempart:${user.email}`);
     const otpauth = `otpauth://totp/${label}?secret=${secretB32}&issuer=Rempart&period=30&digits=6`;
@@ -879,7 +780,7 @@ app.post('/2fa/confirm', async (req, res, next) => {
       'SELECT secret_enc FROM user_totp WHERE user_id = $1', [user.id])).rows[0];
     if (!row) return res.status(400).json({ ok: false, error: 'aucune activation en cours' });
 
-    const secretB32 = totpCipher.decrypt(row.secret_enc);
+    const secretB32 = decryptSecret(row.secret_enc);
     if (!verifyTotp(secretB32, code)) {
       return res.status(400).json({ ok: false, error: 'code invalide' });
     }
@@ -906,14 +807,14 @@ app.post('/2fa/confirm', async (req, res, next) => {
 //   SameSite=Lax : pas envoye sur les requetes cross-site (anti-CSRF)
 //   Secure    : (prod HTTPS) envoye uniquement sur une connexion chiffree
 //   Max-Age   : expiration cote navigateur, alignee sur le TTL serveur
-async function startSession(res, userId) {
-  const sid = await createSession(userId);
+function startSession(res, userId) {
+  const sid = createSession(userId);
   const attrs = [
     `session=${sid}`, 'HttpOnly', 'SameSite=Lax', 'Path=/',
     `Max-Age=${SESSION_TTL_MS / 1000}`,
   ];
   if (COOKIE_SECURE) attrs.push('Secure');
-  res.append('Set-Cookie', attrs.join('; '));
+  res.setHeader('Set-Cookie', attrs.join('; '));
 }
 
 // Repond en JSON (API) ou par une redirection (formulaire HTML).
@@ -926,11 +827,11 @@ function reply(req, res, status, json, redirectTo) {
 async function ensureDemoUser() {
   const hash = await bcrypt.hash('Demo#1234', BCRYPT_ROUNDS);
   await pool.query(
-    `INSERT INTO app_users (email, pass_hash, role)
-     SELECT $1, $2, 'admin' WHERE NOT (SELECT is_called FROM app_users_id_seq)
+    `INSERT INTO app_users (email, pass_hash, role) VALUES ($1, $2, 'admin')
      ON CONFLICT (email) DO NOTHING`,
     ['demo@rempart.local', hash]
   );
+  console.log('[init] utilisateur de demo pret (demo@rempart.local)');
 }
 
 // 404 : page generique, pas de details sur ce qui existe ou non.
