@@ -9,6 +9,37 @@ une base Postgres, le tout lance par Docker Compose en une commande.
 - PostgreSQL (base de donnees)
 - Docker Compose (orchestration)
 
+## HTTPS en local (Caddy + mkcert)
+
+L'app est servie en HTTPS par un reverse proxy **Caddy**, avec des certificats
+**mkcert** (autorite de certification locale de confiance). Caddy redirige
+HTTP -> HTTPS et envoie l'en-tete HSTS.
+
+Mise en place (une fois) :
+
+```bash
+# 1. Installer mkcert (Windows : winget install FiloSottile.mkcert)
+# 2. Installer la CA locale dans le magasin de confiance (navigateur) :
+mkcert -install
+# 3. Generer les certificats localhost (dans certs/, ignores par git) :
+mkcert -cert-file certs/localhost.pem -key-file certs/localhost-key.pem localhost 127.0.0.1 ::1
+# 4. Lancer :
+docker compose up -d
+```
+
+Acces : `https://localhost` (Caddy, HTTPS) ; `http://localhost` redirige vers HTTPS.
+L'app reste aussi accessible en direct sur `http://localhost:8000` (pratique pour
+les tests). Les certificats (`certs/*.pem`) ne sont jamais commites.
+
+Verifications :
+
+```
+curl -k https://localhost/                      # page servie en HTTPS
+curl -D - http://localhost/  | grep -i location # -> 308 vers https://localhost/
+curl -k -D - https://localhost/ | grep -i strict-transport
+# -> Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
 ## Demarrage rapide
 
 ```bash
@@ -702,3 +733,24 @@ l'activation). Chaque code est a **usage unique** (marque `used_at`) et stocke
 **hache** (bcrypt), comme un mot de passe : un vol de base ne les rend pas
 utilisables. Une fois reconnecte, il peut re-scanner un nouveau QR pour
 re-associer un telephone (ce qui remplace le secret et regenere des codes).
+
+## Que garantit TLS, et HSTS en plus ?
+
+TLS (le "S" de HTTPS) garantit, pour la connexion :
+- **Confidentialite** : le trafic est chiffre, un espion sur le reseau ne lit rien.
+- **Integrite** : le contenu ne peut pas etre modifie en transit sans detection.
+- **Authenticite du serveur** : le certificat prouve qu'on parle bien au bon hote
+  (ici, signe par la CA mkcert de confiance locale).
+
+TLS ne garantit PAS :
+- que l'application est **sans faille** (une injection, un XSS, un IDOR restent
+  possibles en HTTPS) ;
+- l'**identite de l'utilisateur** (c'est le role de l'authentification) ;
+- la securite si l'utilisateur arrive d'abord en **HTTP** : la toute premiere
+  requete en clair peut etre interceptee/redirigee (attaque SSL-strip).
+
+HSTS (`Strict-Transport-Security`) ajoute : le navigateur **memorise** qu'il ne
+doit parler a ce domaine QU'en HTTPS, pendant la duree `max-age`. Resultat : apres
+la 1re visite, meme si l'utilisateur tape `http://` ou clique un lien en clair, le
+navigateur passe en HTTPS **tout seul**, avant d'emettre quoi que ce soit. Ca ferme
+la fenetre du SSL-strip que la simple redirection serveur laisse ouverte.

@@ -12,3 +12,6 @@ npm-debug.log*
 
 # Fichiers recus a l execution (pas du code)
 uploads/
+
+# Certificats TLS locaux (mkcert) : cles privees, jamais commitees
+certs/*.pem
