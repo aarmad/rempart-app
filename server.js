@@ -13,8 +13,11 @@ app.use(express.urlencoded({ extended: false })); // formulaires HTML
 const port = process.env.PORT || 8000;
 // Mode debug coupe hors developpement : vrai uniquement si NODE_ENV=development.
 const isDev = process.env.NODE_ENV === 'development';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-insecure-secret';
 const BCRYPT_ROUNDS = 12;             // cout du hachage (lent volontairement)
+const SESSION_TTL_MS = 3600 * 1000;   // expiration de session : 1 h
+// Flag Secure du cookie : a activer en production (HTTPS). En local (http),
+// un cookie Secure ne serait pas renvoye par le navigateur.
+const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 
 // Politique de mot de passe : LONGUEUR minimale, aucune regle de complexite
 // (conforme aux recommandations modernes type NIST : longueur > complexite).
@@ -286,31 +289,37 @@ app.get('/files/:id', (req, res) => {
 // ========================================================================
 //  AUTHENTIFICATION : inscription / connexion / deconnexion
 //  - mot de passe hache avec bcrypt (lent + sel integre), jamais en clair
-//  - session via cookie HttpOnly signe (HMAC), pas de mdp dans le cookie
+//  - session cote SERVEUR : le cookie ne porte qu'un identifiant aleatoire
 // ========================================================================
 
-// Signe un jeton de session : "userId.expiration.signature".
-function signSession(userId) {
-  const exp = Date.now() + 3600 * 1000; // 1 h
-  const data = `${userId}.${exp}`;
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex');
-  return `${data}.${sig}`;
+// Store de session cote serveur : sid -> { userId, expiresAt }.
+// Le cookie ne contient qu'un identifiant opaque, aucune donnee sensible.
+const sessions = new Map();
+
+// Cree une NOUVELLE session (id aleatoire) : appele a chaque connexion, donc
+// l'identifiant est REGENERE au login (parade contre la fixation de session).
+function createSession(userId) {
+  const sid = crypto.randomBytes(32).toString('hex');
+  sessions.set(sid, { userId, expiresAt: Date.now() + SESSION_TTL_MS });
+  return sid;
 }
 
-// Verifie le jeton et renvoie l'userId, ou null.
-function verifySession(token) {
-  if (!token) return null;
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [userId, exp, sig] = parts;
-  const expected = crypto
-    .createHmac('sha256', SESSION_SECRET).update(`${userId}.${exp}`).digest('hex');
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-  if (Date.now() > Number(exp)) return null;
-  return userId;
+// Renvoie la session si elle existe ET n'est pas expiree, sinon null.
+function getSession(sid) {
+  const s = sid && sessions.get(sid);
+  if (!s) return null;
+  if (Date.now() > s.expiresAt) { sessions.delete(sid); return null; } // expiration
+  return s;
 }
+
+// Detruit la session COTE SERVEUR (le jeton ne vaut plus rien, meme copie).
+function destroySession(sid) { if (sid) sessions.delete(sid); }
+
+// Balayage periodique des sessions expirees.
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, s] of sessions) if (now > s.expiresAt) sessions.delete(sid);
+}, 10 * 60 * 1000).unref();
 
 function parseCookies(req) {
   const out = {};
@@ -397,13 +406,16 @@ app.post('/login', async (req, res, next) => {
 
 // --- Deconnexion ----------------------------------------------------------
 app.post('/logout', (req, res) => {
+  // Destruction COTE SERVEUR : la session est supprimee du store...
+  destroySession(parseCookies(req).session);
+  // ...et le cookie est efface cote navigateur (Max-Age=0).
   res.setHeader('Set-Cookie', 'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   return reply(req, res, 200, { ok: true }, '/account');
 });
 
 // --- Qui suis-je (etat de session) ---------------------------------------
 app.get('/me', async (req, res, next) => {
-  const userId = verifySession(parseCookies(req).session);
+  const userId = getSession(parseCookies(req).session)?.userId;
   if (!userId) return res.status(401).json({ ok: false, error: 'non connecte' });
   try {
     const r = await pool.query('SELECT id, email, role FROM app_users WHERE id = $1', [userId]);
@@ -414,7 +426,7 @@ app.get('/me', async (req, res, next) => {
 
 // --- Page compte (formulaires HTML) --------------------------------------
 app.get('/account', async (req, res, next) => {
-  const userId = verifySession(parseCookies(req).session);
+  const userId = getSession(parseCookies(req).session)?.userId;
   try {
     let who = null;
     if (userId) {
@@ -447,11 +459,19 @@ form{margin:.5rem 0 1.5rem}</style></head>
   } catch (err) { next(err); }
 });
 
-// Pose le cookie de session signe (HttpOnly : inaccessible au JavaScript).
+// Cree une session serveur et pose le cookie durci.
+//   HttpOnly  : inaccessible au JavaScript (anti-vol par XSS)
+//   SameSite=Lax : pas envoye sur les requetes cross-site (anti-CSRF)
+//   Secure    : (prod HTTPS) envoye uniquement sur une connexion chiffree
+//   Max-Age   : expiration cote navigateur, alignee sur le TTL serveur
 function startSession(res, userId) {
-  const token = signSession(userId);
-  res.setHeader('Set-Cookie',
-    `session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600`);
+  const sid = createSession(userId);
+  const attrs = [
+    `session=${sid}`, 'HttpOnly', 'SameSite=Lax', 'Path=/',
+    `Max-Age=${SESSION_TTL_MS / 1000}`,
+  ];
+  if (COOKIE_SECURE) attrs.push('Secure');
+  res.setHeader('Set-Cookie', attrs.join('; '));
 }
 
 // Repond en JSON (API) ou par une redirection (formulaire HTML).

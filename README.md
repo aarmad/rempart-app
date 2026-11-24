@@ -477,3 +477,48 @@ tentative 6    -> 429 trop de tentatives, reessayez plus tard
 
 Couvert par deux tests automatises (`test/security.test.js`) : message identique,
 et passage au 429 apres le quota.
+
+## Cookie de session durci (defense)
+
+La session est gardee **cote serveur** (`sessions` Map : `sid -> {userId, expiresAt}`).
+Le cookie ne porte qu'un **identifiant aleatoire opaque**, aucune donnee sensible.
+
+### Les attributs du cookie, expliques
+
+Cookie pose a la connexion :
+
+```
+Set-Cookie: session=<32 octets hex>; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600
+# en production (COOKIE_SECURE=true) :  ... ; Max-Age=3600; Secure
+```
+
+| Attribut | Role |
+| --- | --- |
+| `session=<hex>` | identifiant de session **aleatoire** (32 octets), non devinable ; ne contient ni l'userId ni le mot de passe |
+| `HttpOnly` | le cookie est **inaccessible au JavaScript** (`document.cookie`) : un XSS ne peut pas le voler |
+| `SameSite=Lax` | le cookie **n'est pas envoye sur les requetes cross-site** : parade CSRF |
+| `Secure` | (prod HTTPS, via `COOKIE_SECURE=true`) le cookie n'est envoye que sur une **connexion chiffree** |
+| `Path=/` | le cookie vaut pour tout le site |
+| `Max-Age=3600` | **expiration** cote navigateur (1 h), alignee sur le TTL serveur |
+
+### Identifiant regenere a la connexion
+
+Chaque `POST /login` cree une **nouvelle** session (nouvel id aleatoire) :
+
+```
+connexion 1 -> session=d16e057463b4935b...
+connexion 2 -> session=8fc28b1f0ef00054...   (different : parade fixation de session)
+```
+
+### Session detruite cote serveur au logout + expiration
+
+```
+/me avec le cookie            -> 200 (connecte)
+POST /logout                  -> session supprimee du store serveur
+/me en REJOUANT le meme cookie -> 401 non connecte
+```
+
+Le logout ne se contente pas d'effacer le cookie : il **supprime la session du
+serveur**, donc l'identifiant ne vaut plus rien meme si un attaquant en avait une
+copie. Les sessions ont une **expiration** (`expiresAt`, TTL 1 h) et un balayage
+periodique nettoie celles qui ont expire.
