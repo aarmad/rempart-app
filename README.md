@@ -439,3 +439,41 @@ sel integre + lenteur reglable.
 # dans les logs : aucun mot de passe (on ne journalise que l'id de l'utilisateur)
 docker compose logs app | grep -i 'Demo#1234'   # -> rien
 ```
+
+## Connexion discrete et freinee (defense)
+
+Trois mesures sur `POST /login` et `POST /register` :
+
+| Mesure | Mise en oeuvre |
+| --- | --- |
+| Meme message quel que soit l'echec | e-mail inconnu **et** mauvais mot de passe -> `401 identifiants invalides` (identique) |
+| Pas de fuite par le timing | si l'e-mail n'existe pas, on compare quand meme contre un **hash leurre** (`DUMMY_HASH`) : meme temps de reponse |
+| Tentatives limitees (compte + IP) | compteur d'echecs par e-mail (max 5) et par IP (max 20) sur 15 min -> `429` au-dela ; remis a zero a la connexion reussie |
+| Longueur plutot que complexite | inscription : `password.length >= 10`, aucune regle de type "1 majuscule + 1 chiffre" |
+
+### Que voit-on pour un compte inexistant et pour un mauvais mot de passe ?
+
+Exactement **la meme reponse**, impossible de les distinguer :
+
+```
+# e-mail inconnu
+POST /login {"email":"inconnu@nulle-part.local", ...}
+-> 401 {"ok":false,"error":"identifiants invalides"}
+
+# e-mail connu, mauvais mot de passe
+POST /login {"email":"demo@rempart.local","password":"mauvais"}
+-> 401 {"ok":false,"error":"identifiants invalides"}
+```
+
+Meme statut (401), meme message, meme temps de reponse. Un attaquant ne peut
+donc pas **enumerer** les comptes existants (pas de "cet e-mail n'existe pas").
+
+### Preuve de la limitation (429)
+
+```
+tentative 1..5 -> 401 identifiants invalides
+tentative 6    -> 429 trop de tentatives, reessayez plus tard
+```
+
+Couvert par deux tests automatises (`test/security.test.js`) : message identique,
+et passage au 429 apres le quota.

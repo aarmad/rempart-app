@@ -16,6 +16,32 @@ const isDev = process.env.NODE_ENV === 'development';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-insecure-secret';
 const BCRYPT_ROUNDS = 12;             // cout du hachage (lent volontairement)
 
+// Politique de mot de passe : LONGUEUR minimale, aucune regle de complexite
+// (conforme aux recommandations modernes type NIST : longueur > complexite).
+const MIN_PASSWORD_LENGTH = 10;
+
+// Limitation des tentatives de connexion (anti-brute-force), en memoire.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_FAILS_PER_ACCOUNT = 5;        // par e-mail
+const MAX_FAILS_PER_IP = 20;            // par adresse IP
+const loginFails = new Map();           // cle -> { count, resetAt }
+
+function isBlocked(key, max) {
+  const e = loginFails.get(key);
+  return !!e && Date.now() < e.resetAt && e.count >= max;
+}
+function recordFail(key) {
+  const now = Date.now();
+  let e = loginFails.get(key);
+  if (!e || now > e.resetAt) { e = { count: 0, resetAt: now + LOGIN_WINDOW_MS }; loginFails.set(key, e); }
+  e.count++;
+}
+function resetFails(key) { loginFails.delete(key); }
+
+// Hash leurre : si l'e-mail n'existe pas, on compare quand meme contre ce hash
+// pour que la reponse prenne le MEME temps (pas de fuite par le timing).
+const DUMMY_HASH = bcrypt.hashSync('dummy-password-not-used', BCRYPT_ROUNDS);
+
 // --- Upload verrouille : configuration ------------------------------------
 // Les fichiers sont stockes HORS du dossier public : aucune route statique ne
 // sert ce dossier, seul /files/:id (controle) y donne acces.
@@ -305,8 +331,11 @@ app.post('/register', async (req, res, next) => {
   const email = (req.body?.email || '').toString().trim();
   const password = (req.body?.password || '').toString();
   try {
-    if (!email || password.length < 8) {
-      return reply(req, res, 400, { ok: false, error: 'email requis, mot de passe >= 8 caracteres' });
+    if (!email || password.length < MIN_PASSWORD_LENGTH) {
+      return reply(req, res, 400, {
+        ok: false,
+        error: `email requis, mot de passe >= ${MIN_PASSWORD_LENGTH} caracteres`,
+      });
     }
     // bcrypt : hachage lent, avec sel genere automatiquement et inclus au hash.
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -331,18 +360,33 @@ app.post('/register', async (req, res, next) => {
 app.post('/login', async (req, res, next) => {
   const email = (req.body?.email || '').toString().trim();
   const password = (req.body?.password || '').toString();
+  const ipKey = 'ip:' + req.ip;
+  const emailKey = 'email:' + email.toLowerCase();
   try {
+    // Limitation : trop d'echecs par compte OU par IP -> on freine (429).
+    if (isBlocked(emailKey, MAX_FAILS_PER_ACCOUNT) || isBlocked(ipKey, MAX_FAILS_PER_IP)) {
+      return reply(req, res, 429, { ok: false, error: 'trop de tentatives, reessayez plus tard' });
+    }
+
     // email = PARAMETRE $1 : "' OR '1'='1" reste une simple chaine, pas de bypass.
     const result = await pool.query(
       'SELECT id, email, pass_hash, role FROM app_users WHERE email = $1',
       [email]
     );
     const user = result.rows[0];
-    // bcrypt.compare : rejoue le hash sur la saisie et compare, a temps constant.
-    const okPass = user ? await bcrypt.compare(password, user.pass_hash) : false;
+    // Si l'e-mail n'existe pas, on compare quand meme contre un hash leurre :
+    // meme temps de reponse -> impossible de deviner l'existence du compte.
+    const okPass = await bcrypt.compare(password, user ? user.pass_hash : DUMMY_HASH);
+
     if (!user || !okPass) {
+      // Echec : on incremente les compteurs, et on renvoie le MEME message
+      // (qu'il s'agisse d'un e-mail inconnu ou d'un mauvais mot de passe).
+      recordFail(emailKey);
+      recordFail(ipKey);
       return reply(req, res, 401, { ok: false, error: 'identifiants invalides' });
     }
+
+    resetFails(emailKey); // succes : on remet le compteur du compte a zero
     startSession(res, user.id);
     return reply(req, res, 200,
       { ok: true, user: { id: user.id, email: user.email, role: user.role } }, '/account');

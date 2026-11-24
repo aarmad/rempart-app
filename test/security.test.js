@@ -86,3 +86,36 @@ test('upload interdit refuse (.php deguise en .jpg)', async () => {
   assert.equal(res.status, 415, 'le fichier interdit doit etre refuse (415)');
   assert.equal(body.ok, false);
 });
+
+// --- 4) Connexion discrete : meme message, pas d'enumeration -------------
+test('message identique pour e-mail inconnu et mauvais mot de passe', async () => {
+  const unknown = await fetch(`${BASE}/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'personne@nulle-part.local', password: 'x1234567890' }),
+  });
+  const wrong = await fetch(`${BASE}/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'demo@rempart.local', password: 'mauvais-mdp' }),
+  });
+  const a = await unknown.json();
+  const b = await wrong.json();
+  // Meme statut ET meme message : impossible de savoir si l'e-mail existe.
+  assert.equal(unknown.status, 401);
+  assert.equal(wrong.status, 401);
+  assert.equal(a.error, b.error, 'le message doit etre identique dans les deux cas');
+});
+
+// --- 5) Connexion freinee : la limitation renvoie 429 -------------------
+test('les tentatives sont limitees (429 apres plusieurs echecs)', async () => {
+  const email = `brute-${Date.now()}@test.local`; // compte frais, compteur a 0
+  let last = 0;
+  for (let i = 0; i < 6; i++) {
+    const r = await fetch(`${BASE}/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: 'faux' }),
+    });
+    last = r.status;
+  }
+  // La preuve que le brute-force est freine : la derniere tentative est bloquee.
+  assert.equal(last, 429, 'apres le quota, la connexion doit renvoyer 429');
+});
