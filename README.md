@@ -612,3 +612,50 @@ utilisateur connecte pourrait lire ou modifier la ressource d'un autre en
 changeant simplement l'`id` dans l'URL. La verification du proprietaire est la
 seule chose qui transforme "connecte" (authentification) en "a le droit sur CETTE
 ressource" (autorisation).
+
+## Anti-CSRF (defense)
+
+Toute requete qui MODIFIE (POST/PUT/PATCH/DELETE) doit passer trois barrieres,
+dans un seul middleware (`server.js`) :
+
+| Barriere | Regle |
+| --- | --- |
+| Methode sure | GET/HEAD/OPTIONS ne modifient rien -> aucune action sensible en GET |
+| Controle de l'Origin | si l'entete `Origin` est present, son hote doit etre le notre, sinon `403` |
+| Jeton CSRF (double-submit) | le cookie `csrf` doit egaler le jeton envoye (entete `X-CSRF-Token`, champ `_csrf` ou query) |
+
+Le cookie `csrf` est pose aux visites (`GET /`, `/account`, `/upload`, `/csrf`)
+et n'est pas HttpOnly : les formulaires de **meme origine** le lisent et le
+renvoient. Une page cross-site ne peut ni le lire ni le deviner, et `SameSite=Lax`
+empeche deja l'envoi automatique du cookie de session en cross-site. Les
+formulaires HTML embarquent un champ cache `<input name="_csrf">`.
+
+### Preuve : la meme action sans jeton est refusee
+
+```
+# sans jeton CSRF
+POST /notes {"text":"x"}
+-> 403 {"ok":false,"error":"jeton CSRF manquant ou invalide"}
+
+# avec jeton (cookie csrf == entete X-CSRF-Token)
+POST /notes  (X-CSRF-Token: abc123 ; Cookie: csrf=abc123)
+-> la barriere CSRF est franchie (puis 401 car pas connecte : attendu)
+
+# depuis une origine etrangere
+POST /notes  (Origin: http://evil.example)
+-> 403 {"ok":false,"error":"origine refusee (CSRF)"}
+```
+
+Couvert par un test automatise (`test/security.test.js`, test 9).
+
+### Pourquoi un GET ne doit-il rien modifier ?
+
+Toutes les actions qui changent l'etat sont en **POST/PUT** (jamais en GET).
+Un GET doit etre **sur et idempotent** parce qu'il part tout seul, sans action
+de l'utilisateur ni jeton : un simple `<img src="...">`, un `<a>`, une
+pre-visualisation ou un crawler declenchent des GET. Si une action sensible
+(changer un mot de passe, supprimer, payer) etait accessible en GET, il suffirait
+d'une URL piegee chargee par la victime pour la declencher avec ses cookies —
+exactement la faille CSRF du lab DVWA (`?password_new=...` en GET). Garder les
+GET sans effet de bord, et exiger un jeton CSRF sur les POST/PUT, ferme cette
+porte.

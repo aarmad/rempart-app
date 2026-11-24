@@ -79,6 +79,30 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Protection CSRF : toute requete qui MODIFIE doit prouver son origine ---
+// Les methodes sures (GET/HEAD/OPTIONS) ne modifient rien -> pas de verif.
+// Les autres (POST/PUT/PATCH/DELETE) doivent : (1) venir de notre origine,
+// (2) presenter le jeton CSRF (cookie == valeur envoyee : double-submit).
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return next();
+  }
+  // (1) Controle de l'Origin quand il est present (requetes navigateur).
+  const origin = req.headers.origin;
+  if (origin) {
+    let ok = false;
+    try { ok = new URL(origin).host === req.headers.host; } catch { /* origine invalide */ }
+    if (!ok) return res.status(403).json({ ok: false, error: 'origine refusee (CSRF)' });
+  }
+  // (2) Jeton CSRF : le cookie doit egaler la valeur envoyee (header, champ ou query).
+  const cookieToken = parseCookies(req).csrf;
+  const sent = req.headers['x-csrf-token'] || req.body?._csrf || req.query?._csrf;
+  if (!cookieToken || !sent || !safeEqualStr(cookieToken, sent)) {
+    return res.status(403).json({ ok: false, error: 'jeton CSRF manquant ou invalide' });
+  }
+  next();
+});
+
 // Reponse d'erreur GENERIQUE (jamais de trace technique cote utilisateur).
 // errorId relie la reponse de l'utilisateur au detail journalise cote serveur.
 function respondError(req, res, status, message, errorId) {
@@ -105,6 +129,25 @@ padding:2rem;max-width:34rem}a{color:#ff9a62}</style></head>
   }
 }
 
+// Genere (ou recupere) le jeton CSRF, pose dans un cookie lisible (double-submit).
+// Le cookie n'est PAS HttpOnly : les formulaires/JS de MEME origine doivent le lire
+// pour le renvoyer. Une page cross-site, elle, ne peut ni le lire ni le deviner.
+function ensureCsrf(req, res) {
+  let token = parseCookies(req).csrf;
+  if (!token) {
+    token = crypto.randomBytes(32).toString('hex');
+    res.append('Set-Cookie', `csrf=${token}; SameSite=Lax; Path=/`);
+  }
+  return token;
+}
+
+// Comparaison a temps constant de deux chaines.
+function safeEqualStr(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
 // Echappe une donnee pour l'inserer comme TEXTE dans du HTML.
 // (equivalent d'un template qui echappe : < devient &lt;, etc.)
 function escapeHtml(value) {
@@ -122,6 +165,7 @@ const pool = new Pool({
 
 // Page de garde
 app.get('/', (req, res) => {
+  ensureCsrf(req, res); // pose le cookie CSRF des la 1re visite
   res.type('html').send(`<!doctype html>
 <html lang="fr">
 <head>
@@ -151,6 +195,12 @@ app.get('/', (req, res) => {
   </main>
 </body>
 </html>`);
+});
+
+// Fournit le jeton CSRF (et pose le cookie) : a lire avant toute action.
+app.get('/csrf', (req, res) => {
+  const token = ensureCsrf(req, res);
+  res.json({ ok: true, csrfToken: token });
 });
 
 // Sonde de sante : prouve que l'app parle a la base.
@@ -223,6 +273,7 @@ app.get('/search', async (req, res) => {
 
 // --- Upload verrouille : formulaire ---------------------------------------
 app.get('/upload', (req, res) => {
+  const csrf = ensureCsrf(req, res);
   res.type('html').send(`<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -233,7 +284,7 @@ margin:0;padding:2rem}a{color:#ff9a62}</style></head>
   <p><a href="/">&larr; Accueil</a></p>
   <h1>Upload verrouille</h1>
   <p>Accepte uniquement JPEG / PNG (contenu verifie), max 2 Mo.</p>
-  <form method="post" action="/upload" enctype="multipart/form-data">
+  <form method="post" action="/upload?_csrf=${csrf}" enctype="multipart/form-data">
     <input type="file" name="file" required>
     <button type="submit">Envoyer</button>
   </form>
@@ -427,6 +478,8 @@ app.get('/me', async (req, res, next) => {
 // --- Page compte (formulaires HTML) --------------------------------------
 app.get('/account', async (req, res, next) => {
   const userId = getSession(parseCookies(req).session)?.userId;
+  const csrf = ensureCsrf(req, res); // jeton CSRF, injecte dans chaque formulaire
+  const hidden = `<input type="hidden" name="_csrf" value="${csrf}">`;
   try {
     let who = null;
     if (userId) {
@@ -435,15 +488,15 @@ app.get('/account', async (req, res, next) => {
     }
     const body = who
       ? `<p>Connecte en <strong>${escapeHtml(who)}</strong>.</p>
-         <form method="post" action="/logout"><button>Se deconnecter</button></form>`
+         <form method="post" action="/logout">${hidden}<button>Se deconnecter</button></form>`
       : `<h2>Inscription</h2>
-         <form method="post" action="/register">
+         <form method="post" action="/register">${hidden}
            <input name="email" type="email" placeholder="email" required>
-           <input name="password" type="password" placeholder="mot de passe (>= 8)" required>
+           <input name="password" type="password" placeholder="mot de passe (>= 10)" required>
            <button>S'inscrire</button>
          </form>
          <h2>Connexion</h2>
-         <form method="post" action="/login">
+         <form method="post" action="/login">${hidden}
            <input name="email" type="email" placeholder="email" required>
            <input name="password" type="password" placeholder="mot de passe" required>
            <button>Se connecter</button>
